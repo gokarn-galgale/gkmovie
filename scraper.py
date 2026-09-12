@@ -9,7 +9,7 @@ import cloudscraper
 
 # --- কনফিগারেশন ---
 BASE_URL = "https://fibwatch.art"
-PAGES_TO_SCAN = 5          # ইনক্রিমেন্টাল আপডেটের জন্য প্রতি ক্যাটাগরিতে কয়টি পেজ স্ক্যান করবে
+PAGES_TO_SCAN = 1000       # ইনক্রিমেন্টাল আপডেটের জন্য প্রতি ক্যাটাগরিতে কয়টি পেজ স্ক্যান করবে
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
 MAX_WORKERS = 15           # থ্রেড সংখ্যা
 
