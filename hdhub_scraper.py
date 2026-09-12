@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 import concurrent.futures
 
-BASE_URL = "https://new5.hdhub4u.fo"
+BASE_URL = "https://new5.hdhub4u.cl"
 START_CATEGORY_URL = f"{BASE_URL}/category/south-hindi-movies/page/"
 PLAYLIST_FILE = "hdhub_playlist.m3u"
 
