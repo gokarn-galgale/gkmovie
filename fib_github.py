@@ -10,7 +10,7 @@ import cloudscraper
 # --- Configuration ---
 BASE_URL = "https://fibwatch.art"
 OUTPUT_FILE = "latest_movies.m3u"
-FIRST_RUN_PAGES = 150       # Deep scan per category if file does not exist
+FIRST_RUN_PAGES = 1000     # Deep scan per category if file does not exist
 INCREMENTAL_PAGES = 10      # Fast scan per category on regular cron runs
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
 MAX_WORKERS = 15
