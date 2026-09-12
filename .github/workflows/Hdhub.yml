@@ -1,0 +1,50 @@
+name: HDHub4u M3U Scraper
+
+on:
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab
+  schedule:
+    - cron: '0 */6 * * *' # Automatically runs every 6 hours
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install curl_cffi beautifulsoup4
+
+      - name: Run Scraper
+        run: |
+          python hdhub_scraper.py
+
+      - name: Commit and Push M3U Playlist
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Stage the generated file
+          git add hdhub_playlist.m3u
+          
+          # Only commit and push if the playlist actually changed
+          if git diff --staged --quiet; then
+            echo "No changes found in playlist."
+          else
+            git commit -m "Auto-update: hdhub_playlist.m3u [skip ci]"
+            git pull origin main --rebase --autostash
+            git push origin main
+          fi
+
