@@ -7,13 +7,13 @@ from urllib.parse import unquote, urlparse
 from bs4 import BeautifulSoup
 import cloudscraper
 
-# --- কনফিগারেশন ---
+# --- Configuration ---
 BASE_URL = "https://fibwatch.art"
-PAGES_TO_SCAN = 1000       # ইনক্রিমেন্টাল আপডেটের জন্য প্রতি ক্যাটাগরিতে কয়টি পেজ স্ক্যান করবে
+FIRST_RUN_PAGES = 1000     # Pages to scan if file does not exist
+INCREMENTAL_PAGES = 10     # Pages to scan on subsequent runs
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
-MAX_WORKERS = 15           # থ্রেড সংখ্যা
+MAX_WORKERS = 20           # Concurrent threads
 
-# প্রতিটি থ্রেডের জন্য আলাদা স্ক্র্যাপার সেশন
 thread_local = threading.local()
 
 def get_scraper():
@@ -24,7 +24,6 @@ def get_scraper():
     return thread_local.scraper
 
 def get_resolution(text):
-    """লিংক থেকে রেজোলিউশন বের করে সর্বোচ্চ কোয়ালিটি নিশ্চিত করার জন্য"""
     match = re.search(r'(\d{3,4})p', text, re.IGNORECASE)
     if match:
         return int(match.group(1))
@@ -33,12 +32,18 @@ def get_resolution(text):
     return 0
 
 def get_domain(url):
-    """লিংক থেকে মূল CDN ডোমেন এক্সট্রাক্ট করে"""
     parsed_uri = urlparse(url)
     return f"{parsed_uri.scheme}://{parsed_uri.netloc}"
 
+def extract_file_key(url_or_line):
+    """Extracts the clean target file name for strict duplicate tracking."""
+    clean_url = url_or_line.split('|')[0].strip()
+    match = re.search(r'/([^/?#]+\.(?:mkv|mp4))', clean_url, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    return None
+
 def process_movie(base_name, watch_link, group_name):
-    """মুভির আসল ভিডিও লিংক ও পোস্টার প্রক্সি লিংক বের করে"""
     scraper = get_scraper()
     try:
         res = scraper.get(watch_link, timeout=15)
@@ -52,7 +57,7 @@ def process_movie(base_name, watch_link, group_name):
         for a in watch_soup.find_all('a', href=True):
             href = a['href']
             
-            # urlshortlink থেকে ডিকোড করার লজিক
+            # Shortener decoding
             if 'urlshortlink.top' in href and 'url=' in href:
                 match = re.search(r'url=(.*)', href)
                 if match:
@@ -61,7 +66,7 @@ def process_movie(base_name, watch_link, group_name):
                         actual_link = decoded
                         break
             
-            # ডিরেক্ট মিডিয়া লিংক থাকলে
+            # Direct media link fallback
             elif any(ext in href.lower() for ext in ('.mkv', '.mp4')) and 'urlshortlink.top' not in href:
                 actual_link = href if href.startswith('http') else f"{BASE_URL}{href}"
                 break
@@ -74,19 +79,17 @@ def process_movie(base_name, watch_link, group_name):
         if poster:
             poster = f"{IMAGE_PROXY}{poster}"
         
-        # ফাইলনেম পরিষ্কার করা
-        file_name = actual_link.split('/')[-1].split('?')[0]
-        file_name = re.sub(r'\[Fibwatch\.Com\]|\.mkv|\.mp4', '', file_name, flags=re.IGNORECASE).replace('.', ' ').strip()
+        raw_name = actual_link.split('/')[-1].split('?')[0]
+        file_name = re.sub(r'\[Fibwatch\.Com\]|\.mkv|\.mp4', '', raw_name, flags=re.IGNORECASE).replace('.', ' ').strip()
         final_video_link = f"{actual_link}|Referer={BASE_URL}/"
         
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {file_name}\n{final_video_link}\n'
-        return m3u_entry, get_domain(actual_link), file_name
+        return m3u_entry, get_domain(actual_link), raw_name.lower()
         
     except Exception:
         return None
 
 def scan_single_page(cat_id, page_num):
-    """ক্যাটাগরি পেজ স্ক্যান করে ওয়াচ লিংকগুলো সংগ্রহ করে"""
     url = f"{BASE_URL}/videos/category/{cat_id}?page_id={page_num}"
     scraper = get_scraper()
     found_movies = []
@@ -113,34 +116,50 @@ def scan_single_page(cat_id, page_num):
 
 def run_category_scraper(cat_id, file_name, group_name):
     print(f"\n=======================================================")
-    print(f"🚀 Processing Category: {group_name} (ID: {cat_id})")
+    print(f"🚀 Processing: {group_name} (ID: {cat_id})")
     print(f"=======================================================")
 
-    # ১. বিদ্যমান M3U ফাইল থেকে পুরনো ডাটা ও CDN লোড করা
+    existing_file_keys = set()
     old_entries = []
     old_domain = None
-    if os.path.exists(file_name):
+
+    # Determine whether it is a First Run or Incremental Run
+    file_exists = os.path.exists(file_name) and os.path.getsize(file_name) > 0
+    pages_to_scan = INCREMENTAL_PAGES if file_exists else FIRST_RUN_PAGES
+
+    if file_exists:
         with open(file_name, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-            old_entries = [line for line in lines if not line.startswith('#EXTM3U') and not line.startswith('# Playlist') and not line.startswith('# Last')]
+            old_entries = [
+                line for line in lines 
+                if not line.startswith('#EXTM3U') 
+                and not line.startswith('# Playlist') 
+                and not line.startswith('# Last')
+            ]
             
             for line in old_entries:
-                if '.mkv' in line or '.mp4' in line:
+                key = extract_file_key(line)
+                if key:
+                    existing_file_keys.add(key)
+                if ('.mkv' in line or '.mp4' in line) and not old_domain:
                     clean_link = line.split('|')[0].strip()
                     old_domain = get_domain(clean_link)
-                    break
-        print(f"📁 Existing file found. Previous CDN: {old_domain}")
 
-    # ২. প্রথম কয়েকটি পেজ দ্রুত স্ক্যান করা
-    print(f"⏳ Scanning top {PAGES_TO_SCAN} pages for latest releases...")
+        print(f"📁 Status: Existing file found with {len(existing_file_keys)} items.")
+        print(f"⚡ Mode: INCREMENTAL SCAN ({pages_to_scan} pages). Current CDN: {old_domain}")
+    else:
+        print(f"📁 Status: No previous playlist found.")
+        print(f"⚡ Mode: FIRST TIME DEEP SCAN ({pages_to_scan} pages).")
+
+    # Step 1: Scan Pages Concurrently
     new_movies_links = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_page = {executor.submit(scan_single_page, cat_id, p): p for p in range(1, PAGES_TO_SCAN + 1)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_page = {executor.submit(scan_single_page, cat_id, p): p for p in range(1, pages_to_scan + 1)}
         for future in concurrent.futures.as_completed(future_to_page):
             for base_name, full_link in future.result():
                 current_res = get_resolution(full_link)
                 
-                # সর্বোচ্চ রেজোলিউশনের লিংক রাখা
+                # Deduplicate by keeping highest resolution found on pages
                 if base_name in new_movies_links:
                     existing_link = new_movies_links[base_name]
                     if current_res > get_resolution(existing_link):
@@ -148,9 +167,9 @@ def run_category_scraper(cat_id, file_name, group_name):
                 else:
                     new_movies_links[base_name] = full_link
 
-    print(f"🔎 Found {len(new_movies_links)} candidates from latest pages.")
+    print(f"🔎 Discovered {len(new_movies_links)} candidates from scanned pages.")
 
-    # ৩. নতুন লিংক এক্সট্রাক্ট করা ও CDN শনাক্তকরণ
+    # Step 2: Extract direct links & filter duplicates
     new_entries = []
     new_domain = None
     
@@ -162,45 +181,42 @@ def run_category_scraper(cat_id, file_name, group_name):
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result:
-                entry, domain, clean_title = result
+                entry, domain, file_key = result
                 
-                # টাইটেল চেক করে ডুপ্লিকেট পরিহার করা
-                title_line = entry.split('\n')[0]
-                if not any(title_line in old_line for old_line in old_entries):
+                # Strict check against old files and current batch
+                if file_key not in existing_file_keys:
+                    existing_file_keys.add(file_key)  # Register immediately to block in-run duplicates
                     new_entries.append(entry)
-                    print(f"   ⚡ New Movie Added: {clean_title[:45]}")
+                    print(f"   ⚡ New Movie: {file_key[:45]}")
                     if not new_domain:
                         new_domain = domain
-                        print(f"   🌐 Active CDN Domain: {new_domain}")
 
-    # ৪. যদি CDN পরিবর্তিত হয়ে থাকে, তবে আগের ফাইলগুলোর লিংক রিপ্লেস করা
+    # Step 3: Handle CDN domain updates across existing entries
     if old_domain and new_domain and old_domain != new_domain:
-        print(f"🔄 CDN Change Detected! Updating links from {old_domain} to {new_domain}...")
+        print(f"🔄 CDN Domain changed from {old_domain} -> {new_domain}. Updating existing URLs...")
         old_entries_text = "".join(old_entries)
         old_entries_text = old_entries_text.replace(old_domain, new_domain)
         old_entries = [old_entries_text]
 
-    # ৫. ক্যাটাগরি ফাইল সেভ করা
+    # Step 4: Write output playlist
     bd_time = datetime.now(timezone.utc) + timedelta(hours=6)
     now = bd_time.strftime("%Y-%m-%d %I:%M:%S %p (BD Time)")
     
-    print(f"💾 Saving to {file_name} (New entries: {len(new_entries)})...")
+    print(f"💾 Saving {file_name} (+{len(new_entries)} added)...")
     with open(file_name, "w", encoding="utf-8") as f:
         f.write('#EXTM3U x-tvg-url=""\n')
         f.write(f'# Playlist Generated Automatically for {group_name}\n')
         f.write(f'# Last Updated: {now}\n\n')
         
-        # নতুন মুভিগুলো তালিকার উপরে থাকবে
+        # Newest releases stay on top
         for entry in new_entries:
             f.write(entry)
             
-        # পুরনো ডাটা যোগ করা
         f.write("".join(old_entries))
 
-    print(f"✅ Successfully updated {file_name}!")
+    print(f"✅ Finished updating {file_name} successfully!")
 
 def main():
-    # আগের কোডের মতো ক্যাটাগরি ম্যাপিং
     categories = [
         {"cat_id": "4", "file_name": "Hindi-Movies.m3u", "group_name": "Hindi Movies"},
         {"cat_id": "5", "file_name": "Hindi-DubbedMovies.m3u", "group_name": "Hindi-Dubbed Movies"},
@@ -214,8 +230,6 @@ def main():
             file_name=cat["file_name"],
             group_name=cat["group_name"]
         )
-    
-    print("\n🎉 All category playlists have been processed and updated successfully!")
 
 if __name__ == "__main__":
     main()
