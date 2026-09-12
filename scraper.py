@@ -5,7 +5,7 @@ from datetime import datetime
 import concurrent.futures
 
 BASE_URL = "https://fibwatch.art"
-MAX_PAGES_TO_SCAN = 150  # সর্বোচ্চ ১৫০ পেজ পর্যন্ত একসাথে স্ক্যান করবে (বাড়াতে/কমাতে পারবেন)
+MAX_PAGES_TO_SCAN = 1000  # সর্বোচ্চ ১৫০ পেজ পর্যন্ত একসাথে স্ক্যান করবে (বাড়াতে/কমাতে পারবেন)
 
 # আপনার অরিজিনাল লিংক ভাঙার ফাংশন
 def process_movie(base_name, watch_link, quality, scraper, group_name):
