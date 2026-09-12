@@ -37,7 +37,14 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          git add latest_movies.m3u
-          git commit -m "Auto-updated Fibwatch Latest Playlist" || exit 0
-          git pull origin main --rebase --autostash
-          git push origin main
+          
+       git add *.m3u *.json || echo "No files to add"
+        
+        if git diff --cached --quiet; then
+          echo "No changes detected. Skipping commit."
+          exit 0
+        fi
+        
+        git commit -m "Auto-update playlists $(date -u)"
+        git pull --rebase origin main
+        git push
