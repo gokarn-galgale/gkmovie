@@ -19,8 +19,8 @@ REQUEST_TIMEOUT = 15
 
 # Categories matching the site structure
 CATEGORIES = [
-    {"slug": "genre/hindi", "group_name": "Hindi Movies"},
-    {"slug": "genre/hindi-dubbed", "group_name": "Hindi-Dubbed Movies"}
+    {"slug": "bollywood-movies-on-prmovies", "group_name": "Hindi Movies"},
+    {"slug": "genre/hollywood-dubbed", "group_name": "Hindi-Dubbed Movies"}
 ]
 
 USER_AGENT = (
