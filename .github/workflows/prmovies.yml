@@ -2,9 +2,12 @@ name: Update Prmovies Playlist
 
 on:
   schedule:
-    # Runs every 6 hours
     - cron: '0 */6 * * *'
   workflow_dispatch:
+
+# Add write permissions for GITHUB_TOKEN
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -12,6 +15,9 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          # Ensure it uses the token with write permissions
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,8 +34,7 @@ jobs:
 
       - name: Commit and Push Changes
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
           git add prmovies_playlist.m3u
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update playlist [skip ci]" && git push)
-
+          git diff --staged --quiet || (git commit -m "Auto-update playlist [skip ci]" && git push)
