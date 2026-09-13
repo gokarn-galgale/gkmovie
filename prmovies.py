@@ -11,16 +11,15 @@ from urllib3.util import Retry
 
 # --- Configuration ---
 BASE_URL = "https://prmovies.energy"
+PLAYLIST_NAME = "prmovies.energy"
 OUTPUT_FILE = "prmovies_playlist.m3u"
-FIRST_RUN_PAGES = 50
-INCREMENTAL_PAGES = 3
-MAX_WORKERS = 8
-REQUEST_TIMEOUT = 15
+PAGES_TO_SCAN = 3
+MAX_WORKERS = 4
+REQUEST_TIMEOUT = 20
 
-# Categories matching the site structure
+# Target category path
 CATEGORIES = [
-    {"slug": "bollywood-movies-on-prmovies", "group_name": "Hindi Movies"},
-    {"slug": "genre/hollywood-dubbed", "group_name": "Hindi-Dubbed Movies"}
+    {"path": "bollywood-movies-on-prmovies", "group_name": "Bollywood Movies"}
 ]
 
 USER_AGENT = (
@@ -32,14 +31,13 @@ USER_AGENT = (
 thread_local = threading.local()
 
 def get_scraper():
-    """Initializes a thread-safe Cloudscraper instance with automated retry logic."""
     if not hasattr(thread_local, "scraper"):
         scraper = cloudscraper.create_scraper(
             browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
         )
         retries = Retry(
             total=3,
-            backoff_factor=0.6,
+            backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             raise_on_status=False
         )
@@ -49,21 +47,12 @@ def get_scraper():
         thread_local.scraper = scraper
     return thread_local.scraper
 
-def get_resolution_score(text):
-    """Scores resolution quality to select the highest quality link available."""
-    match = re.search(r'(\d{3,4})p', text, re.IGNORECASE)
-    if match:
-        return int(match.group(1))
-    if '4k' in text.lower() or '2160' in text:
-        return 2160
-    return 0
-
 def unpack_packer(packed_js):
-    """Simple unpacker for Dean Edwards p,a,c,k,e,d JavaScript blocks used by hosts."""
+    """Deobfuscates Dean Edwards p,a,c,k,e,d JavaScript blocks."""
     match = re.search(r"}\s*\('(.*)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)", packed_js, re.DOTALL)
     if not match:
         return ""
-    payload, radix_str, count_str, symtab_str = match.groups()
+    payload, radix_str, _, symtab_str = match.groups()
     radix = int(radix_str)
     symtab = symtab_str.split('|')
 
@@ -81,221 +70,184 @@ def unpack_packer(packed_js):
 
     return re.sub(r'\b[0-9a-zA-Z]+\b', replace_token, payload)
 
-def resolve_stream_source(host_url):
-    """Navigates through speedostream / stream pages and extracts the direct media link."""
+def extract_jwplayer_stream(html_content):
+    """Extracts direct m3u8 or mp4 stream URLs from JW Player configurations."""
+    # 1. Look for packed JavaScript blocks
+    if 'eval(function(p,a,c,k,e,d)' in html_content:
+        for block in re.findall(r"eval\(function\(p,a,c,k,e,d\).*?\.split\('\|'\)\)\)", html_content, re.DOTALL):
+            unpacked = unpack_packer(block)
+            match = re.search(r'["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', unpacked)
+            if match:
+                return match.group(1)
+
+    # 2. Look for jwplayer setup block
+    jw_match = re.search(r'jwplayer\([^)]*\)\.setup\(\s*\{.*?\}\s*\);', html_content, re.DOTALL)
+    search_scope = jw_match.group(0) if jw_match else html_content
+
+    # Match 'file' or 'source' parameters
+    stream_match = re.search(r'(?:file|source)\s*:\s*["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', search_scope, re.I)
+    if stream_match:
+        return stream_match.group(1)
+
+    # 3. Direct regex match on any playable stream URL in the DOM
+    fallback = re.search(r'["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', html_content)
+    if fallback:
+        return fallback.group(1)
+
+    return None
+
+def resolve_speedostream(speedo_url):
+    """Handles the first 'Proceed to video' gate and parses JW Player on the destination page."""
     scraper = get_scraper()
     try:
-        resp = scraper.get(host_url, timeout=REQUEST_TIMEOUT, headers={"Referer": BASE_URL})
-        if resp.status_code != 200:
+        # Step 1: Open first speedostream page
+        res = scraper.get(speedo_url, headers={"User-Agent": USER_AGENT, "Referer": BASE_URL}, timeout=REQUEST_TIMEOUT)
+        if res.status_code != 200:
             return None
 
-        # Check for intermediate "Proceed to video" button shown in the video
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        proceed_link = soup.find('a', string=re.compile(r'proceed to video', re.I))
-        if proceed_link and proceed_link.get('href'):
-            next_url = proceed_link['href']
-            if not next_url.startswith('http'):
-                next_url = urljoin(host_url, next_url)
-            resp = scraper.get(next_url, timeout=REQUEST_TIMEOUT, headers={"Referer": host_url})
-            soup = BeautifulSoup(resp.text, 'html.parser')
+        soup = BeautifulSoup(res.text, 'html.parser')
+        second_page_url = None
+        post_data = {}
 
-        content = resp.text
+        # Check for form submission or anchor button for "Proceed to video"
+        form = soup.find('form')
+        proceed_btn = soup.find(lambda tag: tag.name in ['a', 'button'] and 'proceed' in tag.get_text().lower())
 
-        # 1. Look for direct video tag
-        video_tag = soup.find('video')
-        if video_tag:
-            src = video_tag.get('src')
-            if src:
-                return src
-            source = video_tag.find('source')
-            if source and source.get('src'):
-                return source['src']
+        if form:
+            action = form.get('action') or speedo_url
+            second_page_url = action if action.startswith('http') else urljoin(speedo_url, action)
+            for inp in form.find_all('input'):
+                if inp.get('name'):
+                    post_data[inp.get('name')] = inp.get('value', '')
+        elif proceed_btn and proceed_btn.name == 'a' and proceed_btn.get('href'):
+            href = proceed_btn['href']
+            second_page_url = href if href.startswith('http') else urljoin(speedo_url, href)
 
-        # 2. Check for packed JS containing m3u8/mp4
-        if 'eval(function(p,a,c,k,e,d)' in content:
-            unpacked = unpack_packer(content)
-            stream_match = re.search(r'["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', unpacked)
-            if stream_match:
-                return stream_match.group(1)
+        # Step 2: Request the second page (player page)
+        if second_page_url:
+            if post_data:
+                player_res = scraper.post(second_page_url, data=post_data, headers={"User-Agent": USER_AGENT, "Referer": speedo_url}, timeout=REQUEST_TIMEOUT)
+            else:
+                player_res = scraper.get(second_page_url, headers={"User-Agent": USER_AGENT, "Referer": speedo_url}, timeout=REQUEST_TIMEOUT)
+            content = player_res.text
+            final_referer = second_page_url
+        else:
+            content = res.text
+            final_referer = speedo_url
 
-        # 3. Direct regex match on page script sources
-        stream_match = re.search(r'["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', content)
-        if stream_match:
-            return stream_match.group(1)
+        # Step 3: Extract the stream URL from JW Player
+        stream_url = extract_jwplayer_stream(content)
+        if stream_url:
+            return f"{stream_url}|Referer={final_referer}&User-Agent={USER_AGENT}"
 
     except Exception:
         pass
     return None
 
-def process_movie_detail(detail_url, group_name):
-    """Scrapes the movie detail page, identifies highest quality download row, and resolves stream."""
+def process_movie(movie_url, group_name):
+    """Visits movie details page, finds speedostream link in download table, and resolves video."""
     scraper = get_scraper()
     try:
-        res = scraper.get(detail_url, timeout=REQUEST_TIMEOUT)
+        res = scraper.get(movie_url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
         if res.status_code != 200:
             return None
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Extract Title
-        title_tag = soup.find('h1') or soup.find('meta', property='og:title')
-        if not title_tag:
-            return None
-        title = title_tag.get('content', '') if title_tag.name == 'meta' else title_tag.get_text(strip=True)
-        clean_title = re.sub(r'[\r\n\t]+', ' ', title).strip()
-
-        # Extract Poster
+        # Movie Title & Poster
+        title_tag = soup.find('h1', class_='entry-title') or soup.find('h1')
+        title = title_tag.get_text(strip=True) if title_tag else "Unknown Movie"
+        
         poster_tag = soup.find('meta', property='og:image')
         poster = poster_tag['content'] if poster_tag and poster_tag.get('content') else ""
 
-        # Parse Download / Server Table (as shown at 00:05-00:08 in the video)
-        best_link = None
-        best_score = -1
+        # Find speedostream1 link in the Download Section/Table
+        speedo_link = None
+        for a in soup.find_all('a', href=True):
+            if 'speedostream' in a['href']:
+                speedo_link = a['href']
+                break
 
-        rows = soup.find_all('tr')
-        for row in rows:
-            text = row.get_text()
-            link_tag = row.find('a', href=True)
-            if link_tag and ('speedostream' in link_tag['href'] or 'download' in text.lower() or 'quality' in text.lower() or 'p' in text.lower()):
-                score = get_resolution_score(text)
-                if score > best_score:
-                    best_score = score
-                    best_link = link_tag['href']
-
-        # Fallback: inspect any speedostream button on page
-        if not best_link:
-            for a in soup.find_all('a', href=True):
-                if 'speedostream' in a['href']:
-                    best_link = a['href']
-                    break
-
-        if not best_link:
+        if not speedo_link:
             return None
 
-        # Resolve final playable video link from the host
-        final_stream = resolve_stream_source(best_link)
-        if not final_stream:
-            # If JavaScript rendering prevents headless extraction, use the host link with player headers
-            final_stream = best_link
+        playable_stream = resolve_speedostream(speedo_link)
+        if not playable_stream:
+            return None
 
-        final_url = f"{final_stream}|Referer={BASE_URL}/&User-Agent={USER_AGENT}"
-        extinf = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {clean_title}'
-        
-        # Unique identifier derived from movie slug
-        slug = urlparse(detail_url).path.strip('/').split('/')[-1]
-        return {
-            "extinf": extinf,
-            "url": final_url,
-            "key": slug
-        }
+        extinf = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {title}'
+        return f"{extinf}\n{playable_stream}\n"
+
     except Exception:
         return None
 
-def scan_catalog_page(category_slug, page_num):
-    """Scrapes individual movie cards from the category index pages."""
-    url = f"{BASE_URL}/{category_slug}/page/{page_num}/" if page_num > 1 else f"{BASE_URL}/{category_slug}/"
+def scan_category(path, page_num):
+    """Fetches movie cards from the given category page."""
+    url = f"{BASE_URL}/{path}/page/{page_num}/" if page_num > 1 else f"{BASE_URL}/{path}/"
     scraper = get_scraper()
     movie_links = []
     try:
-        resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code != 200:
+        res = scraper.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+        if res.status_code != 200:
             return []
 
-        soup = BeautifulSoup(resp.text, 'html.parser')
+        soup = BeautifulSoup(res.text, 'html.parser')
         
-        # Select cards linking to individual posts/movies
+        # Matches movie cards inside DooPlay/WordPress movie wrappers
         for a in soup.find_all('a', href=True):
             href = a['href']
-            # Match movie detail permalinks
-            if re.search(r'/(movie|movies|film)/[^/]+/?$', href) or (BASE_URL in href and a.find('img')):
-                full_url = href if href.startswith('http') else urljoin(BASE_URL, href)
-                if full_url != BASE_URL and full_url not in movie_links:
-                    movie_links.append(full_url)
+            # Target movie post URLs while filtering out pagination/tags
+            if f"{BASE_URL}/movies/" in href or f"{BASE_URL}/movie/" in href:
+                if href not in movie_links:
+                    movie_links.append(href)
+
+        # Fallback card selection
+        if not movie_links:
+            for div in soup.find_all('div', class_=re.compile(r'poster|item')):
+                a_tag = div.find('a', href=True)
+                if a_tag and a_tag['href'].startswith(BASE_URL) and a_tag['href'] not in movie_links:
+                    movie_links.append(a_tag['href'])
 
         return list(set(movie_links))
     except Exception:
         return []
 
 def main():
-    print("🚀 Starting Prmovies Scraping Job for GitHub Actions...")
-
-    existing_keys = set()
-    old_entries = []
-
-    # Check if a playlist file already exists
-    if os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0:
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-            i = 0
-            while i < len(lines):
-                if lines[i].startswith("#EXTINF"):
-                    extinf = lines[i]
-                    if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
-                        url_line = lines[i + 1]
-                        old_entries.append((extinf, url_line))
-                        # Use title or url substring as key
-                        key_match = re.search(r'group-title="[^"]*",\s*(.+)$', extinf)
-                        if key_match:
-                            existing_keys.add(key_match.group(1).strip().lower())
-                        i += 2
-                        continue
-                i += 1
-        pages_to_scan = INCREMENTAL_PAGES
-        print(f"📁 Existing playlist detected ({len(old_entries)} items). Running in INCREMENTAL mode.")
-    else:
-        pages_to_scan = FIRST_RUN_PAGES
-        print(f"📁 No playlist found. Running DEEP SCAN ({pages_to_scan} pages per category).")
-
+    print(f"🚀 Starting scraper for {PLAYLIST_NAME}...")
     new_entries = []
 
     for cat in CATEGORIES:
         group_name = cat["group_name"]
-        slug = cat["slug"]
-        print(f"\n[+] Scanning Category: {group_name}")
+        path = cat["path"]
+        print(f"Scanning category: {group_name}...")
 
-        discovered_urls = set()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            page_tasks = {
-                executor.submit(scan_catalog_page, slug, p): p 
-                for p in range(1, pages_to_scan + 1)
-            }
-            for task in concurrent.futures.as_completed(page_tasks):
-                for m_url in task.result():
-                    discovered_urls.add(m_url)
+        all_movie_urls = set()
+        for page in range(1, PAGES_TO_SCAN + 1):
+            urls = scan_category(path, page)
+            all_movie_urls.update(urls)
 
-        print(f"    Found {len(discovered_urls)} movie links. Extracting video streams...")
+        print(f"Found {len(all_movie_urls)} movie URLs. Resolving player streams...")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            detail_tasks = {
-                executor.submit(process_movie_detail, m_url, group_name): m_url 
-                for m_url in discovered_urls
-            }
-            for task in concurrent.futures.as_completed(detail_tasks):
-                data = task.result()
-                if data and data["key"] not in existing_keys:
-                    existing_keys.add(data["key"])
-                    new_entries.append(data)
-                    print(f"    ⚡ Added: {data['key'][:50]}")
+            future_to_url = {executor.submit(process_movie, url, group_name): url for url in all_movie_urls}
+            for future in concurrent.futures.as_completed(future_to_url):
+                result = future.result()
+                if result:
+                    new_entries.append(result)
+                    print("  ⚡ Successfully extracted stream")
 
-    # Write out unified M3U8 file with Bangladesh Time stamp
     bd_time = datetime.now(timezone.utc) + timedelta(hours=6)
     timestamp = bd_time.strftime("%Y-%m-%d %I:%M:%S %p (BD Time)")
 
-    print(f"\n💾 Writing updates to {OUTPUT_FILE} (+{len(new_entries)} new entries)...")
+    print(f"Writing {len(new_entries)} streams to {OUTPUT_FILE}...")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        f.write('#EXTM3U x-tvg-url=""\n')
-        f.write(f'# Playlist Generated from Prmovies\n')
+        f.write(f'#EXTM3U x-tvg-url="" x-tvg-name="{PLAYLIST_NAME}"\n')
+        f.write(f'#PLAYLIST:{PLAYLIST_NAME}\n')
         f.write(f'# Last Updated: {timestamp}\n\n')
-
-        # Prepend new entries so latest releases appear first
         for entry in new_entries:
-            f.write(f"{entry['extinf']}\n{entry['url']}\n")
+            f.write(entry)
 
-        for extinf, url_line in old_entries:
-            f.write(f"{extinf}\n{url_line}\n")
-
-    print("🎉 Sync completed successfully!")
+    print("Completed.")
 
 if __name__ == "__main__":
     main()
-
