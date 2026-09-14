@@ -3,7 +3,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
 
-SOURCE_URL = "https://raw.githubusercontent.com/msplayerott/yeash/refs/heads/main/wak_tu/db4.json"
+SOURCE_URL = "https://raw.githubusercontent.com/msplayerott/yeash/refs/heads/main/wak_tu/db2.json"
 OUTPUT_FILE = "playlist.m3u"
 
 
