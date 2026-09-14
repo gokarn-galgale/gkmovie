@@ -1,0 +1,40 @@
+name: Generate M3U Playlist
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # Runs every 6 hours
+  workflow_dispatch:        # Allows manual trigger via GitHub web UI
+  push:
+    paths:
+      - 'convert.py'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch Remote JSON and Generate M3U
+        run: python convert.py
+
+      - name: Commit and Push Playlist
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add playlist.m3u
+          if git diff --staged --quiet; then
+            echo "No updates detected in playlist.m3u."
+          else
+            git commit -m "chore: sync playlist.m3u from remote source"
+            git push
+          fi
