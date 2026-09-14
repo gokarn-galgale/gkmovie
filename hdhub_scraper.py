@@ -4,8 +4,8 @@ import re
 from datetime import datetime
 import concurrent.futures
 
-BASE_URL = "https://new5.hdhub4u.cl"
-START_CATEGORY_URL = f"{BASE_URL}/category/south-hindi-movies/page/"
+BASE_URL = "https://fibwatch.art"
+START_CATEGORY_URL = f"{BASE_URL}/videos/category/4"
 PLAYLIST_FILE = "hdhub_playlist.m3u"
 
 def unpack(p, a, c, k):
