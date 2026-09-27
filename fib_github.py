@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 import cloudscraper
 
 # --- Configuration ---
-BASE_URL = "https://fibwatch.art"
+BASE_URL = "http://fibwatch.art"
 OUTPUT_FILE = "latest_movies.m3u"
 FIRST_RUN_PAGES = 1000     # Deep scan per category if file does not exist
 INCREMENTAL_PAGES = 10      # Fast scan per category on regular cron runs
