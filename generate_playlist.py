@@ -1,7 +1,7 @@
 import os
 import re
-import sys
 import urllib.parse
+from collections import deque
 import requests
 from bs4 import BeautifulSoup
 
@@ -9,6 +9,7 @@ BASE_URL = "http://103.225.94.27/Infobase/"
 OUTPUT_FILE = "playlist.m3u"
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v")
 
+# Categories to match (case-insensitive)
 CATEGORY_RULES = [
     ("Hindi Dubbed", re.compile(r"hindi\s*dub", re.IGNORECASE)),
     ("South Dubbed", re.compile(r"south\s*dub", re.IGNORECASE)),
@@ -31,61 +32,102 @@ def clean_title(filename: str) -> str:
     return re.sub(r"[._]", " ", base_name).strip()
 
 
-def crawl(url: str, session: requests.Session, current_category: str | None, visited: set) -> list:
-    if url in visited:
-        return []
-    visited.add(url)
+def normalize_url(url: str) -> str:
+    """Strips query parameters and fragments to eliminate duplicate crawls."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
-    items = []
 
+def run_crawler():
+    session = requests.Session()
+    # Adapter with 0 retries and strict timeout to avoid hanging
+    adapter = requests.adapters.HTTPAdapter(max_retries=1)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "*/*"
+    })
+
+    print(f"Connecting to: {BASE_URL}")
+
+    # Connectivity probe with a strict 8-second timeout
     try:
-        response = session.get(url, timeout=20)
-        if response.status_code != 200:
-            print(f"[!] Warning: HTTP {response.status_code} on {url}")
-            return items
-    except requests.exceptions.RequestException as err:
-        print(f"[!] Request failed for {url}: {err}")
-        return items
+        res = session.get(BASE_URL, timeout=(5, 8))
+        print(f"Server replied with HTTP status: {res.status_code}")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Failed to connect to server: {e}")
+        print("The server is unreachable or dropping cloud IP connections. Exiting to avoid hanging.")
+        write_m3u([], OUTPUT_FILE)
+        return
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    links = soup.find_all("a", href=True)
+    # Use BFS (Queue) instead of deep recursion to prevent stack and loop issues
+    queue = deque([(BASE_URL, None)])
+    visited = set()
+    videos = []
+    
+    max_dirs_to_crawl = 2000  # Hard circuit breaker
+    dirs_checked = 0
 
-    for link in links:
-        href = link.get("href")
+    while queue and dirs_checked < max_dirs_to_crawl:
+        current_url, current_category = queue.popleft()
+        norm_url = normalize_url(current_url)
 
-        # Skip directory sorting queries, parent pointers, anchors
-        if href in ("../", "./", "/") or href.startswith("?") or href.startswith("#"):
+        if norm_url in visited:
+            continue
+        visited.add(norm_url)
+        dirs_checked += 1
+
+        print(f"[{dirs_checked}] Crawling: {norm_url}")
+
+        try:
+            # (connect timeout: 5s, read timeout: 8s)
+            response = session.get(norm_url, timeout=(5, 8))
+            if response.status_code != 200:
+                continue
+        except requests.RequestException:
+            print(f"Timeout/Error loading {norm_url}, skipping...")
             continue
 
-        target_url = urllib.parse.urljoin(url, href)
+        soup = BeautifulSoup(response.text, "html.parser")
 
-        # Stay within root
-        if not target_url.startswith(BASE_URL):
-            continue
+        for link in soup.find_all("a", href=True):
+            href = link.get("href").strip()
 
-        # Extract path to verify extension or folder name
-        parsed = urllib.parse.urlsplit(target_url)
-        path = parsed.path
+            # Ignore relative parent paths, query sorting, anchors
+            if href in ("../", "./", "/") or href.startswith("?") or href.startswith("#"):
+                continue
 
-        # Check if the folder name updates category context
-        folder_category = detect_category(href) or current_category
+            target_url = urllib.parse.urljoin(norm_url, href)
+            target_norm = normalize_url(target_url)
 
-        is_video = any(path.lower().endswith(ext) for ext in VIDEO_EXTS)
+            # Keep inside Infobase
+            if not target_norm.startswith(BASE_URL):
+                continue
 
-        if is_video:
-            if folder_category:
-                title = clean_title(os.path.basename(path))
-                items.append({
-                    "title": title,
-                    "url": target_url,
-                    "category": folder_category
-                })
-                print(f"[{folder_category}] Found: {title}")
-        else:
-            # Recurse down subfolders
-            items.extend(crawl(target_url, session, folder_category, visited))
+            # Update category context
+            matched_category = detect_category(target_norm) or current_category
 
-    return items
+            parsed_path = urllib.parse.urlsplit(target_norm).path
+            is_video = any(parsed_path.lower().endswith(ext) for ext in VIDEO_EXTS)
+
+            if is_video:
+                if matched_category:
+                    filename = os.path.basename(parsed_path)
+                    title = clean_title(filename)
+                    videos.append({
+                        "title": title,
+                        "url": target_norm,
+                        "category": matched_category
+                    })
+            else:
+                # Directory to traverse
+                if target_norm not in visited and (href.endswith("/") or "." not in parsed_path.split("/")[-1]):
+                    queue.append((target_norm, matched_category))
+
+    print(f"\nDiscovered {len(videos)} matching items across {dirs_checked} directories.")
+    videos.sort(key=lambda x: (x["category"], x["title"].lower()))
+    write_m3u(videos, OUTPUT_FILE)
 
 
 def write_m3u(entries: list, filepath: str):
@@ -94,43 +136,8 @@ def write_m3u(entries: list, filepath: str):
         for item in entries:
             f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}",{item["title"]}\n')
             f.write(f"{item['url']}\n\n")
-    print(f"\nWritten {len(entries)} items to {filepath}")
-
-
-def main():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1"
-    })
-
-    print(f"Checking access to base URL: {BASE_URL}")
-
-    # Connectivity and diagnosis probe
-    try:
-        res = session.get(BASE_URL, timeout=15)
-        print(f"Server replied with Status Code: {res.status_code}")
-        print(f"Content Length: {len(res.text)} bytes")
-        if res.status_code != 200:
-            print("Response preview:\n", res.text[:500])
-    except Exception as e:
-        print(f"\n[CRITICAL ERROR] Runner cannot reach {BASE_URL}: {e}")
-        print("\nDIAGNOSIS:")
-        print("This server does not route outside of its local ISP network.")
-        print("Because GitHub Actions runs on Microsoft Azure IP addresses, the ISP firewall is dropping incoming packets.")
-        print("To bypass this while running purely on GitHub, you can set a free/paid regional proxy in GitHub Repo Secrets (REGIONAL_PROXY).")
-        write_m3u([], OUTPUT_FILE)
-        return
-
-    visited = set()
-    videos = crawl(BASE_URL, session, None, visited)
-
-    videos.sort(key=lambda x: (x["category"], x["title"].lower()))
-    write_m3u(videos, OUTPUT_FILE)
+    print(f"File saved to {filepath}")
 
 
 if __name__ == "__main__":
-    main()
+    run_crawler()
