@@ -1,4 +1,4 @@
-name: Generate M3U Playlist (Cloud)
+name: Generate M3U Playlist
 
 on:
   schedule:
@@ -14,6 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20  # Enforces a hard limit so it never hangs
 
     steps:
       - name: Check out repository
@@ -27,15 +28,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 urllib3
+          pip install requests beautifulsoup4
 
       - name: Run Crawler
-        env:
-          # Optional: Add a free/paid regional proxy URL if the ISP blocks cloud IPs
-          # e.g., http://user:pass@proxy-ip:port
-          HTTP_PROXY: ${{ secrets.REGIONAL_PROXY }}
-          HTTPS_PROXY: ${{ secrets.REGIONAL_PROXY }}
         run: |
+          # Flush Python standard output immediately to see logs in real-time
+          export PYTHONUNBUFFERED=1
           python generate_playlist.py
 
       - name: Commit and push changes
