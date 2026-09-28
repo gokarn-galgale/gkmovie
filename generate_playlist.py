@@ -1,107 +1,115 @@
 import os
 import re
-import sys
 import urllib.parse
 from collections import deque
 import requests
 from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
-BASE_URL = "http://103.225.94.27/Infobase/"
 OUTPUT_FILE = "playlist.m3u"
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v")
 
-# Explicit exclusions: completely discard folders matching drama* or dub*
-EXCLUDE_PATTERN = re.compile(r"(dub|drama)", re.IGNORECASE)
-
-# Target categories: subfolders starting with Hindi, English, or Kids
-CATEGORY_RULES = [
-    ("Hindi", re.compile(r"^hindi", re.IGNORECASE)),
-    ("English", re.compile(r"^english", re.IGNORECASE)),
-    ("Kids", re.compile(r"^kids", re.IGNORECASE)),
-]
+# Explicit mapping of categories to their designated target URLs
+CATEGORY_SEEDS = {
+    "English": [
+        "http://103.225.94.27/Infobase/hdd-1/English/",
+        "http://103.225.94.27/Infobase/hdd-2/English2.0/",
+        "http://103.225.94.27/Infobase/hdd-3/english/",
+        "http://103.225.94.27/Infobase/hdd-5/English%20.5/",
+        "http://103.225.94.27/Infobase/hdd-5/English%20.5/2025-26/",
+        "http://103.225.94.27/Infobase/hdd-5/English%20.5/Charlie%20Chaplin%20/",
+    ],
+    "Hindi Dubbed": [
+        "http://103.225.94.27/Infobase/hdd-1/HINDI%20DUBBED/",
+        "http://103.225.94.27/Infobase/hdd-2/Hindi%20Dub2.0/",
+        "http://103.225.94.27/Infobase/hdd-3/Hindi%20Dub/",
+        "http://103.225.94.27/Infobase/hdd-5/hindi%20dub.5/",
+    ],
+    "Korean": [
+        "http://103.225.94.27/Infobase/hdd-1/Korean/",
+        "http://103.225.94.27/Infobase/hdd-2/Korean/",
+    ],
+    "Hindi": [
+        "http://103.225.94.27/Infobase/hdd-1/Hindi/",
+        "http://103.225.94.27/Infobase/hdd-2/hindi2.0/",
+        "http://103.225.94.27/Infobase/hdd-3/hindi/",
+        "http://103.225.94.27/Infobase/hdd-5/hindi.5/",
+        "http://103.225.94.27/Infobase/hdd-5/hindi.5/2025-26/",
+        "http://103.225.94.27/Infobase/hdd-5/hindi.5/aug%202026%20/",
+    ],
+    "Kids": [
+        "http://103.225.94.27/Infobase/hdd-1/Animation/English/",
+        "http://103.225.94.27/Infobase/hdd-2/Anime/",
+    ],
+    "Hindi Drama": [
+        "http://103.225.94.27/Infobase/hdd-1/Hindi%20Drama/",
+        "http://103.225.94.27/Infobase/hdd-2/Hindi%20Drama%202.0/",
+        "http://103.225.94.27/Infobase/hdd-3/Hindi%20Drama/",
+        "http://103.225.94.27/Infobase/hdd-5/hindi%20drama%20.5/",
+    ],
+    "English Drama": [
+        "http://103.225.94.27/Infobase/hdd-1/english%20drama/",
+        "http://103.225.94.27/Infobase/hdd-2/english%20drama/",
+        "http://103.225.94.27/Infobase/hdd-3/English%20Drama/",
+        "http://103.225.94.27/Infobase/hdd-5/English%20Drama%20.5/",
+    ],
+}
 
 
 def clean_url(url: str) -> str:
-    """Removes query params (?C=N;O=D), fragments (#), and strips trailing slashes for clean matching."""
+    """Strips query strings (?C=N;O=D) and anchors (#) to stop Apache listing loops."""
     parts = urllib.parse.urlsplit(url)
-    clean_path = parts.path
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, clean_path, "", ""))
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def classify_folder(name: str) -> str | None:
-    """Matches folder name starting with Hindi, English, Kids while excluding drama/dub."""
-    clean = urllib.parse.unquote(name).strip().strip("/")
-    
-    if EXCLUDE_PATTERN.search(clean):
-        return None
+def format_title(filename: str, parent_folder: str, is_drama: bool) -> str:
+    """Decodes URL percent-encoding and formats series episodes as Show - Episode."""
+    decoded_file = urllib.parse.unquote(filename)
+    base_file, _ = os.path.splitext(decoded_file)
+    clean_file = re.sub(r"[._]", " ", base_file).strip()
 
-    for cat_name, pattern in CATEGORY_RULES:
-        if pattern.search(clean):
-            return cat_name
-    return None
-
-
-def clean_title(filename: str) -> str:
-    decoded = urllib.parse.unquote(filename)
-    base_name, _ = os.path.splitext(decoded)
-    return re.sub(r"[._]", " ", base_name).strip()
+    if is_drama and parent_folder:
+        clean_show = re.sub(r"[._]", " ", urllib.parse.unquote(parent_folder)).strip()
+        # Prevent duplicate show title if episode filename already includes it
+        if clean_show.lower() not in clean_file.lower():
+            return f"{clean_show} - {clean_file}"
+            
+    return clean_file
 
 
-def run_crawler():
-    session = requests.Session()
-    
-    # Aggressive fail-fast adapter: 0 retries to avoid hanging on slow/dead sockets
-    adapter = HTTPAdapter(max_retries=0, pool_connections=10, pool_maxsize=10)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
-        "Connection": "close",
-    })
-
-    print(f"Connecting to base URL: {BASE_URL}", flush=True)
-
-    # Fast connection check (3s connect timeout, 5s read timeout)
-    try:
-        res = session.get(BASE_URL, timeout=(3.0, 5.0))
-        print(f"Connected successfully (HTTP {res.status_code})", flush=True)
-    except Exception as e:
-        print(f"[!] Target server unreachable: {e}", flush=True)
-        write_m3u([], OUTPUT_FILE)
-        return
-
-    # Queue structure: (url, current_category, current_depth)
-    queue = deque([(BASE_URL, None, 0)])
+def crawl_category(category: str, seeds: list, session: requests.Session) -> list:
+    items = []
     visited_paths = set()
-    videos = []
+    is_drama = "drama" in category.lower()
+    
+    # Queue item: (url, parent_folder_name, depth)
+    queue = deque()
+    for seed in seeds:
+        normalized_seed = clean_url(seed)
+        if not normalized_seed.endswith("/"):
+            normalized_seed += "/"
+        queue.append((normalized_seed, "", 0))
 
-    dirs_scanned = 0
-    MAX_DIRS = 800     # Hard stop limit
-    MAX_DEPTH = 5      # Never go deeper than 5 folders (prevents recursive symlinks)
-
-    while queue and dirs_scanned < MAX_DIRS:
-        curr_url, curr_cat, depth = queue.popleft()
+    while queue:
+        curr_url, parent_folder, depth = queue.popleft()
         
-        # Canonical path check to avoid symlink & trailing-slash cycles
-        parsed_curr = urllib.parse.urlsplit(curr_url)
-        norm_path = os.path.normpath(urllib.parse.unquote(parsed_curr.path))
+        # Enforce maximum folder depth of 5
+        if depth > 5:
+            continue
 
-        if norm_path in visited_paths or depth > MAX_DEPTH:
+        parsed = urllib.parse.urlsplit(curr_url)
+        norm_path = os.path.normpath(urllib.parse.unquote(parsed.path))
+        if norm_path in visited_paths:
             continue
         visited_paths.add(norm_path)
-        dirs_scanned += 1
-
-        print(f"[{dirs_scanned}] Scanning (Depth {depth}): {norm_path}", flush=True)
 
         try:
-            # Strict per-request timeouts (3s to connect, 5s to read HTML)
-            response = session.get(curr_url, timeout=(3.0, 5.0))
+            # Per-request timeouts: 3s connect, 6s read
+            response = session.get(curr_url, timeout=(3.0, 6.0))
             if response.status_code != 200:
                 continue
             html_text = response.text
         except requests.RequestException:
-            print(f"  --> Timeout on {norm_path}, skipping branch.", flush=True)
             continue
 
         soup = BeautifulSoup(html_text, "html.parser")
@@ -109,70 +117,46 @@ def run_crawler():
         for link in soup.find_all("a", href=True):
             raw_href = link.get("href").strip()
 
-            # 1. KILL ALL APACHE SORT QUERY STRINGS & ANCHORS
+            # Ignore Apache directory parameters, anchors, and root/parent directory jumps
             if "?" in raw_href or "#" in raw_href:
                 continue
-
-            # 2. KILL PARENT AND ROOT LINKS
             if raw_href in ("../", "./", "/", ""):
                 continue
-
-            # 3. Discard 'Parent Directory' text labels
             if "parent directory" in link.text.lower():
                 continue
 
             target_url = urllib.parse.urljoin(curr_url, raw_href)
             target_url = clean_url(target_url)
 
-            # Ensure we stay within /Infobase/
-            if not target_url.startswith(BASE_URL):
+            # Prevent stepping backwards outside the seed path
+            if not any(target_url.startswith(clean_url(s).rstrip("/") + "/") or target_url == clean_url(s) for s in seeds):
                 continue
 
             parsed_target = urllib.parse.urlsplit(target_url)
-            target_norm_path = os.path.normpath(urllib.parse.unquote(parsed_target.path))
+            target_norm = os.path.normpath(urllib.parse.unquote(parsed_target.path))
 
-            if target_norm_path in visited_paths:
+            if target_norm in visited_paths:
                 continue
 
-            folder_or_file_name = os.path.basename(target_norm_path)
-            is_video = any(target_norm_path.lower().endswith(ext) for ext in VIDEO_EXTS)
+            file_or_folder = os.path.basename(target_norm)
+            is_video = any(target_norm.lower().endswith(ext) for ext in VIDEO_EXTS)
 
             if is_video:
-                if curr_cat:
-                    title = clean_title(folder_or_file_name)
-                    videos.append({
-                        "title": title,
-                        "url": target_url,
-                        "category": curr_cat
-                    })
-                    print(f"  [+] ({curr_cat}) {title}", flush=True)
+                title = format_title(file_or_folder, parent_folder, is_drama)
+                items.append({
+                    "title": title,
+                    "url": target_url,
+                    "category": category
+                })
+                print(f"[{category}] {title}", flush=True)
             else:
-                # Directory branch
-                folder_clean = folder_or_file_name
+                # Sub-directory detected: keep moving down
+                current_folder_name = file_or_folder
+                if not target_url.endswith("/"):
+                    target_url += "/"
+                queue.append((target_url, current_folder_name, depth + 1))
 
-                # Reject any folder containing drama or dub
-                if EXCLUDE_PATTERN.search(folder_clean):
-                    continue
-
-                if not curr_cat:
-                    # Test if this folder triggers our Hindi / English / Kids filter
-                    detected = classify_folder(folder_clean)
-                    
-                    # If it's a top-level drive (e.g., hdd-1, hdd-2), allow entering to look for matching folders
-                    is_drive_folder = bool(re.search(r"hdd|drive|disk", folder_clean, re.IGNORECASE))
-                    
-                    if detected:
-                        queue.append((target_url, detected, depth + 1))
-                    elif is_drive_folder:
-                        queue.append((target_url, None, depth + 1))
-                    # All other non-matching folders (software, anime, games) are dropped immediately
-                else:
-                    # Already inside a matched category: recurse subfolders under same category
-                    queue.append((target_url, curr_cat, depth + 1))
-
-    print(f"\nScan completed. Found {len(videos)} videos across {dirs_scanned} directories.", flush=True)
-    videos.sort(key=lambda x: (x["category"], x["title"].lower()))
-    write_m3u(videos, OUTPUT_FILE)
+    return items
 
 
 def write_m3u(entries: list, filepath: str):
@@ -181,8 +165,28 @@ def write_m3u(entries: list, filepath: str):
         for item in entries:
             f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}",{item["title"]}\n')
             f.write(f"{item['url']}\n\n")
-    print(f"M3U saved to {filepath}", flush=True)
+    print(f"\nM3U successfully generated at {filepath} with {len(entries)} items.", flush=True)
+
+
+def main():
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=0, pool_connections=15, pool_maxsize=15)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+        "Connection": "close",
+    })
+
+    all_videos = []
+    for category, seeds in CATEGORY_SEEDS.items():
+        print(f"\n--- Scanning Category: {category} ---", flush=True)
+        category_videos = crawl_category(category, seeds, session)
+        all_videos.extend(category_videos)
+
+    all_videos.sort(key=lambda x: (x["category"], x["title"].lower()))
+    write_m3u(all_videos, OUTPUT_FILE)
 
 
 if __name__ == "__main__":
-    run_crawler()
+    main()
