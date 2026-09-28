@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 8 # Cancels automatically if the runner hangs
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
@@ -30,9 +30,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Run Crawler
+      - name: Run Playlist Generator
         env:
-          PYTHONUNBUFFERED: "1" # Real-time line-by-line logging in GitHub Actions
+          PYTHONUNBUFFERED: "1"
         run: |
           python generate_playlist.py
 
