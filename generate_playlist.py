@@ -1,18 +1,20 @@
 import os
 import re
+import sys
 import urllib.parse
 from collections import deque
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 BASE_URL = "http://103.225.94.27/Infobase/"
 OUTPUT_FILE = "playlist.m3u"
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v")
 
-# Exclusion filter: discard folders starting with or containing drama* or dub*
+# Explicit exclusions: completely discard folders matching drama* or dub*
 EXCLUDE_PATTERN = re.compile(r"(dub|drama)", re.IGNORECASE)
 
-# Inclusion rules: subfolders starting with the target name
+# Target categories: subfolders starting with Hindi, English, or Kids
 CATEGORY_RULES = [
     ("Hindi", re.compile(r"^hindi", re.IGNORECASE)),
     ("English", re.compile(r"^english", re.IGNORECASE)),
@@ -20,129 +22,155 @@ CATEGORY_RULES = [
 ]
 
 
-def classify_folder(folder_name: str) -> str | None:
-    """Checks if a folder starts with Hindi, English, or Kids, while excluding drama* and dub*."""
-    clean_name = urllib.parse.unquote(folder_name).strip().strip("/")
+def clean_url(url: str) -> str:
+    """Removes query params (?C=N;O=D), fragments (#), and strips trailing slashes for clean matching."""
+    parts = urllib.parse.urlsplit(url)
+    clean_path = parts.path
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, clean_path, "", ""))
+
+
+def classify_folder(name: str) -> str | None:
+    """Matches folder name starting with Hindi, English, Kids while excluding drama/dub."""
+    clean = urllib.parse.unquote(name).strip().strip("/")
     
-    # 1. Skip if it contains 'drama' or 'dub'
-    if EXCLUDE_PATTERN.search(clean_name):
+    if EXCLUDE_PATTERN.search(clean):
         return None
 
-    # 2. Check if it starts with one of the allowed prefixes
-    for category_name, pattern in CATEGORY_RULES:
-        if pattern.search(clean_name):
-            return category_name
-
+    for cat_name, pattern in CATEGORY_RULES:
+        if pattern.search(clean):
+            return cat_name
     return None
 
 
 def clean_title(filename: str) -> str:
-    """Decodes URL encoding and cleans extensions and separators."""
     decoded = urllib.parse.unquote(filename)
     base_name, _ = os.path.splitext(decoded)
     return re.sub(r"[._]", " ", base_name).strip()
 
 
-def normalize_url(url: str) -> str:
-    """Strips query parameters (?C=N;O=D) and anchors to avoid looping."""
-    parts = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-
-
 def run_crawler():
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(max_retries=1)
+    
+    # Aggressive fail-fast adapter: 0 retries to avoid hanging on slow/dead sockets
+    adapter = HTTPAdapter(max_retries=0, pool_connections=10, pool_maxsize=10)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "*/*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+        "Connection": "close",
     })
 
-    print(f"Connecting to base URL: {BASE_URL}")
+    print(f"Connecting to base URL: {BASE_URL}", flush=True)
 
-    # Connectivity probe with short timeout
+    # Fast connection check (3s connect timeout, 5s read timeout)
     try:
-        res = session.get(BASE_URL, timeout=(5, 8))
-        print(f"Connected successfully (HTTP {res.status_code})")
+        res = session.get(BASE_URL, timeout=(3.0, 5.0))
+        print(f"Connected successfully (HTTP {res.status_code})", flush=True)
     except Exception as e:
-        print(f"\n[CRITICAL ERROR] Failed to connect: {e}")
+        print(f"[!] Target server unreachable: {e}", flush=True)
         write_m3u([], OUTPUT_FILE)
         return
 
-    # Queue contains: (url, current_category)
-    queue = deque([(BASE_URL, None)])
-    visited = set()
+    # Queue structure: (url, current_category, current_depth)
+    queue = deque([(BASE_URL, None, 0)])
+    visited_paths = set()
     videos = []
 
     dirs_scanned = 0
-    max_dirs = 3000  # Safety circuit breaker
+    MAX_DIRS = 800     # Hard stop limit
+    MAX_DEPTH = 5      # Never go deeper than 5 folders (prevents recursive symlinks)
 
-    while queue and dirs_scanned < max_dirs:
-        current_url, current_category = queue.popleft()
-        norm_url = normalize_url(current_url)
+    while queue and dirs_scanned < MAX_DIRS:
+        curr_url, curr_cat, depth = queue.popleft()
+        
+        # Canonical path check to avoid symlink & trailing-slash cycles
+        parsed_curr = urllib.parse.urlsplit(curr_url)
+        norm_path = os.path.normpath(urllib.parse.unquote(parsed_curr.path))
 
-        if norm_url in visited:
+        if norm_path in visited_paths or depth > MAX_DEPTH:
             continue
-        visited.add(norm_url)
+        visited_paths.add(norm_path)
         dirs_scanned += 1
 
+        print(f"[{dirs_scanned}] Scanning (Depth {depth}): {norm_path}", flush=True)
+
         try:
-            response = session.get(norm_url, timeout=(5, 8))
+            # Strict per-request timeouts (3s to connect, 5s to read HTML)
+            response = session.get(curr_url, timeout=(3.0, 5.0))
             if response.status_code != 200:
                 continue
+            html_text = response.text
         except requests.RequestException:
+            print(f"  --> Timeout on {norm_path}, skipping branch.", flush=True)
             continue
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(html_text, "html.parser")
 
         for link in soup.find_all("a", href=True):
-            href = link.get("href").strip()
+            raw_href = link.get("href").strip()
 
-            # Skip Apache sort links, parent directories, and anchors
-            if href in ("../", "./", "/") or href.startswith("?") or href.startswith("#"):
+            # 1. KILL ALL APACHE SORT QUERY STRINGS & ANCHORS
+            if "?" in raw_href or "#" in raw_href:
                 continue
 
-            target_url = urllib.parse.urljoin(norm_url, href)
-            target_norm = normalize_url(target_url)
-
-            if not target_norm.startswith(BASE_URL):
+            # 2. KILL PARENT AND ROOT LINKS
+            if raw_href in ("../", "./", "/", ""):
                 continue
 
-            parsed_path = urllib.parse.urlsplit(target_norm).path
-            is_video = any(parsed_path.lower().endswith(ext) for ext in VIDEO_EXTS)
+            # 3. Discard 'Parent Directory' text labels
+            if "parent directory" in link.text.lower():
+                continue
+
+            target_url = urllib.parse.urljoin(curr_url, raw_href)
+            target_url = clean_url(target_url)
+
+            # Ensure we stay within /Infobase/
+            if not target_url.startswith(BASE_URL):
+                continue
+
+            parsed_target = urllib.parse.urlsplit(target_url)
+            target_norm_path = os.path.normpath(urllib.parse.unquote(parsed_target.path))
+
+            if target_norm_path in visited_paths:
+                continue
+
+            folder_or_file_name = os.path.basename(target_norm_path)
+            is_video = any(target_norm_path.lower().endswith(ext) for ext in VIDEO_EXTS)
 
             if is_video:
-                # Add video only if it is inside an active, accepted category
-                if current_category:
-                    title = clean_title(os.path.basename(parsed_path))
+                if curr_cat:
+                    title = clean_title(folder_or_file_name)
                     videos.append({
                         "title": title,
-                        "url": target_norm,
-                        "category": current_category
+                        "url": target_url,
+                        "category": curr_cat
                     })
-                    print(f"[{current_category}] {title}")
+                    print(f"  [+] ({curr_cat}) {title}", flush=True)
             else:
-                # It's a directory
-                folder_name = href.strip("/")
-                
-                # If not inside a category yet, check if this folder initiates one
-                if not current_category:
-                    assigned_category = classify_folder(folder_name)
-                    # If this folder is excluded (e.g. drama/dub), do NOT enter it
-                    if EXCLUDE_PATTERN.search(urllib.parse.unquote(folder_name)):
-                        continue
+                # Directory branch
+                folder_clean = folder_or_file_name
+
+                # Reject any folder containing drama or dub
+                if EXCLUDE_PATTERN.search(folder_clean):
+                    continue
+
+                if not curr_cat:
+                    # Test if this folder triggers our Hindi / English / Kids filter
+                    detected = classify_folder(folder_clean)
+                    
+                    # If it's a top-level drive (e.g., hdd-1, hdd-2), allow entering to look for matching folders
+                    is_drive_folder = bool(re.search(r"hdd|drive|disk", folder_clean, re.IGNORECASE))
+                    
+                    if detected:
+                        queue.append((target_url, detected, depth + 1))
+                    elif is_drive_folder:
+                        queue.append((target_url, None, depth + 1))
+                    # All other non-matching folders (software, anime, games) are dropped immediately
                 else:
-                    # Already inside a category, but ensure subfolder itself isn't a excluded drama/dub
-                    if EXCLUDE_PATTERN.search(urllib.parse.unquote(folder_name)):
-                        continue
-                    assigned_category = current_category
+                    # Already inside a matched category: recurse subfolders under same category
+                    queue.append((target_url, curr_cat, depth + 1))
 
-                # Queue the directory to crawl
-                if target_norm not in visited:
-                    queue.append((target_norm, assigned_category))
-
-    print(f"\nDiscovered {len(videos)} matching items across {dirs_scanned} directories.")
+    print(f"\nScan completed. Found {len(videos)} videos across {dirs_scanned} directories.", flush=True)
     videos.sort(key=lambda x: (x["category"], x["title"].lower()))
     write_m3u(videos, OUTPUT_FILE)
 
@@ -153,7 +181,7 @@ def write_m3u(entries: list, filepath: str):
         for item in entries:
             f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}",{item["title"]}\n')
             f.write(f"{item['url']}\n\n")
-    print(f"File successfully written to {filepath}")
+    print(f"M3U saved to {filepath}", flush=True)
 
 
 if __name__ == "__main__":
