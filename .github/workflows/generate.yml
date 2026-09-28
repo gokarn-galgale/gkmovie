@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Enforces a hard limit so it never hangs
+    timeout-minutes: 8 # Cancels automatically if the runner hangs
 
     steps:
       - name: Check out repository
@@ -31,9 +31,9 @@ jobs:
           pip install requests beautifulsoup4
 
       - name: Run Crawler
+        env:
+          PYTHONUNBUFFERED: "1" # Real-time line-by-line logging in GitHub Actions
         run: |
-          # Flush Python standard output immediately to see logs in real-time
-          export PYTHONUNBUFFERED=1
           python generate_playlist.py
 
       - name: Commit and push changes
@@ -42,7 +42,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add playlist.m3u
           if git diff --staged --quiet; then
-            echo "No changes found in playlist."
+            echo "No changes found."
           else
             git commit -m "Auto-update playlist.m3u [skip ci]"
             git push origin HEAD:main
