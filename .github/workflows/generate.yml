@@ -1,10 +1,9 @@
-name: Update M3U Playlist
+name: Generate M3U Playlist (Cloud)
 
 on:
   schedule:
-    # Runs at 00:00 UTC every day
     - cron: '0 0 * * *'
-  workflow_dispatch: # Allows manual trigger from Actions tab
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -25,16 +24,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install requests beautifulsoup4 urllib3
 
-      - name: Generate M3U Playlist
+      - name: Run Crawler
+        env:
+          # Optional: Add a free/paid regional proxy URL if the ISP blocks cloud IPs
+          # e.g., http://user:pass@proxy-ip:port
+          HTTP_PROXY: ${{ secrets.REGIONAL_PROXY }}
+          HTTPS_PROXY: ${{ secrets.REGIONAL_PROXY }}
         run: |
           python generate_playlist.py
 
-      - name: Commit and Push Updated Playlist
+      - name: Commit and push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -43,5 +47,5 @@ jobs:
             echo "No changes found in playlist."
           else
             git commit -m "Auto-update playlist.m3u [skip ci]"
-            git push
+            git push origin HEAD:main
           fi
