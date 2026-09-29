@@ -13,10 +13,10 @@ CATEGORY_PATH = "/category/hollywood-hindi-movies/"
 GROUP_NAME = "Hollywood Hindi Movies"
 OUTPUT_FILE = "hollywood_hindi_movies.m3u"
 
-FIRST_RUN_PAGES = 50        # Pages to scan on initial run
-INCREMENTAL_PAGES = 5       # Pages to scan on cron/scheduled runs
+FIRST_RUN_PAGES = 15
+INCREMENTAL_PAGES = 3
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
-MAX_WORKERS = 10
+MAX_WORKERS = 8
 
 thread_local = threading.local()
 
@@ -28,140 +28,111 @@ def get_scraper():
     return thread_local.scraper
 
 def get_domain(url):
-    parsed_uri = urlparse(url)
-    return f"{parsed_uri.scheme}://{parsed_uri.netloc}"
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 def extract_file_key(url_or_line):
-    """Extracts a unique movie/stream key for deduplication."""
-    clean_url = url_or_line.split('|')[0].strip()
-    match = re.search(r'/([^/?#]+\.(?:mkv|mp4|m3u8))', clean_url, re.IGNORECASE)
+    clean = url_or_line.split('|')[0].strip()
+    match = re.search(r'/([^/?#]+\.(?:mkv|mp4|m3u8))', clean, re.IGNORECASE)
     if match:
         return match.group(1).lower()
-    return clean_url.rstrip('/').split('/')[-1].lower()
+    return clean.rstrip('/').split('/')[-1].split('?')[0].lower()
 
-def extract_stream_link_from_html(html_text, base_context_url):
+def extract_multidownload_link(html_text, page_url):
     """
-    Parses 'Copy Stream Link' elements or player embed sources:
-    - data-url, data-link, data-clipboard-text, value attributes
-    - JavaScript clipboard/copy functions: copyLink('...'), copyStream('...')
-    - Direct m3u8/mp4 URLs inside player configs
+    Finds the 'Copy Stream Link' matching *multidownload.*
+    Searches anchor tags, data attributes, onclick scripts, and raw text.
     """
     soup = BeautifulSoup(html_text, 'html.parser')
-    
-    # 1. Search buttons/anchors labeled 'Copy Stream Link', 'Copy Link', or 'Stream'
-    copy_candidates = soup.find_all(
-        lambda tag: tag.name in ['a', 'button', 'input', 'div', 'span'] and 
-        bool(re.search(r'copy\s*(stream|link)|stream\s*link|watch\s*stream', tag.get_text() or '', re.IGNORECASE))
-    )
-    
-    for tag in copy_candidates:
-        # Check standard data/value attributes
-        for attr in ['data-url', 'data-link', 'data-stream', 'data-clipboard-text', 'value', 'href']:
-            val = tag.get(attr)
-            if val and any(ext in val.lower() for ext in ('.m3u8', '.mp4', '.mkv', 'manifest', 'stream')):
-                return urljoin(base_context_url, val.strip())
 
-        # Check onclick handlers like copyText('https://...') or setClipboard('https://...')
-        onclick = tag.get('onclick', '')
-        match = re.search(r"['\"](https?://[^'\"]+\.(?:m3u8|mp4|mkv)[^'\"]*)['\"]", onclick, re.IGNORECASE)
-        if match:
-            return match.group(1)
+    # 1. Direct href checks
+    for a in soup.find_all(['a', 'link'], href=True):
+        href = a['href'].strip()
+        if 'multidownload.' in href.lower():
+            return urljoin(page_url, href)
 
-    # 2. Check all elements carrying data-clipboard-text or data-url attributes
-    for el in soup.find_all(attrs={"data-clipboard-text": True}):
-        val = el["data-clipboard-text"].strip()
-        if val.startswith("http") or any(ext in val.lower() for ext in ('.m3u8', '.mp4', '.mkv')):
-            return val
+    # 2. Check attributes like data-url, data-link, data-clipboard-text, value
+    for tag in soup.find_all(attrs=True):
+        for attr in ['data-url', 'data-link', 'data-clipboard-text', 'data-src', 'value']:
+            val = tag.attrs.get(attr)
+            if isinstance(val, str) and 'multidownload.' in val.lower():
+                return urljoin(page_url, val.strip())
 
-    for el in soup.find_all(attrs={"data-url": True}):
-        val = el["data-url"].strip()
-        if any(ext in val.lower() for ext in ('.m3u8', '.mp4', '.mkv')):
-            return urljoin(base_context_url, val)
-
-    # 3. Check for embedded iframe player source
-    iframe = soup.find('iframe', src=True)
-    if iframe:
-        iframe_src = urljoin(base_context_url, iframe['src'])
-        if any(ext in iframe_src.lower() for ext in ('.m3u8', '.mp4', '.mkv')):
-            return iframe_src
-
-    # 4. Search script blocks for file / source URLs
-    script_matches = re.findall(r'(?:file|source|src)\s*:\s*["\'](https?://[^"\']+\.(?:m3u8|mp4|mkv)[^"\']*)["\']', html_text, re.IGNORECASE)
-    if script_matches:
-        return script_matches[0]
+    # 3. Regex scan for multidownload URLs inside JavaScript and raw HTML
+    matches = re.findall(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', html_text, re.IGNORECASE)
+    if matches:
+        # Clean potential trailing characters
+        clean_match = matches[0].rstrip('\\";),')
+        return clean_match
 
     return None
 
 def process_movie(title, post_url, group_name):
-    """
-    Step 1: Open movie page.
-    Step 2: Find 'Watch Online' option.
-    Step 3: Extract the stream link from 'Copy Stream Link' or embedded player.
-    """
     scraper = get_scraper()
     try:
-        res = scraper.get(post_url, timeout=15)
+        res = scraper.get(post_url, timeout=(6, 12))
         if res.status_code != 200:
             return None
 
         soup = BeautifulSoup(res.text, 'html.parser')
-        
-        # Extract Poster
+
+        # Extract poster
         poster = ""
         poster_meta = soup.find('meta', property='og:image')
         if poster_meta and poster_meta.get('content'):
             poster = f"{IMAGE_PROXY}{poster_meta['content']}"
 
         # Clean display title
-        h1_tag = soup.find('h1')
-        display_name = h1_tag.get_text(strip=True) if h1_tag else title
+        h1 = soup.find('h1')
+        display_name = h1.get_text(strip=True) if h1 else title
+        display_name = re.sub(r'[\r\n]+', ' ', display_name).strip()
 
-        # --- Find "Watch Online" Option ---
-        watch_online_href = None
-        for a in soup.find_all(['a', 'button'], href=True):
-            text = (a.get_text() or "").strip()
+        # Step 2: Find "Watch Online" link starting with *.multicloudlinks.com
+        multicloud_url = None
+        for a in soup.find_all('a', href=True):
             href = a['href'].strip()
-            if re.search(r'watch\s*online|stream\s*online|play\s*online', text, re.IGNORECASE) or 'watch' in href.lower():
-                watch_online_href = urljoin(post_url, href)
+            if 'multicloudlinks.com' in href.lower():
+                multicloud_url = href
                 break
 
-        actual_stream_link = None
+        # Fallback check inside iframe src if not directly in an <a> tag
+        if not multicloud_url:
+            for ifr in soup.find_all('iframe', src=True):
+                if 'multicloudlinks.com' in ifr['src'].lower():
+                    multicloud_url = ifr['src']
+                    break
 
-        # If a dedicated "Watch Online" subpage exists, fetch it
-        if watch_online_href and watch_online_href != post_url:
-            try:
-                watch_res = scraper.get(watch_online_href, timeout=15)
-                if watch_res.status_code == 200:
-                    actual_stream_link = extract_stream_link_from_html(watch_res.text, watch_online_href)
-            except Exception:
-                pass
-
-        # If not found yet, check the main post page itself (many themes keep player on main post)
-        if not actual_stream_link:
-            actual_stream_link = extract_stream_link_from_html(res.text, post_url)
-
-        if not actual_stream_link:
+        if not multicloud_url:
             return None
 
-        # Clean wrapped query parameters like ?url=...
-        if 'url=' in actual_stream_link:
-            param_match = re.search(r'url=([^&]+)', actual_stream_link)
-            if param_match:
-                decoded = unquote(param_match.group(1))
-                if any(ext in decoded.lower() for ext in ('.m3u8', '.mp4', '.mkv')):
-                    actual_stream_link = decoded
+        # Step 3: Visit the multicloudlinks page to get the multidownload stream link
+        cloud_headers = {"Referer": post_url}
+        cloud_res = scraper.get(multicloud_url, headers=cloud_headers, timeout=(6, 12))
+        if cloud_res.status_code != 200:
+            return None
 
-        clean_file_key = extract_file_key(actual_stream_link)
-        final_video_link = f"{actual_stream_link}|Referer={BASE_URL}/"
+        stream_link = extract_multidownload_link(cloud_res.text, multicloud_url)
+        if not stream_link:
+            return None
+
+        # Clean any redirect wrappers (?url=...)
+        if 'url=' in stream_link:
+            param = re.search(r'url=([^&]+)', stream_link)
+            if param:
+                decoded = unquote(param.group(1))
+                if 'multidownload.' in decoded.lower():
+                    stream_link = decoded
+
+        clean_file_key = extract_file_key(stream_link)
+        final_video_link = f"{stream_link}|Referer={multicloud_url}"
 
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {display_name}\n{final_video_link}\n'
-        return m3u_entry, get_domain(actual_stream_link), clean_file_key
+        return m3u_entry, get_domain(stream_link), clean_file_key
 
     except Exception:
         return None
 
 def scan_single_page(page_num):
-    """Scrapes post links from pagination pages."""
     if page_num == 1:
         url = urljoin(BASE_URL, CATEGORY_PATH)
     else:
@@ -170,33 +141,30 @@ def scan_single_page(page_num):
     scraper = get_scraper()
     found_movies = []
     try:
-        response = scraper.get(url, timeout=15)
+        response = scraper.get(url, timeout=(6, 12))
         if response.status_code != 200:
             return []
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Grab post containers
-        articles = soup.find_all(['article', 'div'], class_=re.compile(r'(post|item|movie|film|entry)', re.IGNORECASE))
-        if not articles:
-            articles = [soup]
+        posts = soup.find_all(['article', 'div'], class_=re.compile(r'(post|item|movie|film|entry)', re.IGNORECASE))
+        if not posts:
+            posts = [soup]
 
-        for container in articles:
+        for container in posts:
             for a in container.find_all('a', href=True):
                 href = a['href']
                 full_url = urljoin(BASE_URL, href)
-                
-                # Exclude taxonomy, pagination, tag, and home links
+                text = a.get_text(strip=True)
+
                 if (
                     full_url.startswith(BASE_URL)
                     and not re.search(r'/(category|tag|author|page)/', full_url)
                     and full_url.rstrip('/') != BASE_URL.rstrip('/')
+                    and len(text) > 4
                 ):
-                    title = a.get_text(strip=True)
-                    if len(title) > 3:
-                        found_movies.append((title, full_url))
+                    found_movies.append((text, full_url))
 
-        # Deduplicate per page
+        # Deduplicate page entries
         dedup = {}
         for title, link in found_movies:
             if link not in dedup:
@@ -207,13 +175,12 @@ def scan_single_page(page_num):
         return []
 
 def main():
-    print(f"🚀 Starting Scraper for {GROUP_NAME}...")
+    print(f"🚀 Starting Scraper for {GROUP_NAME}...", flush=True)
 
     existing_file_keys = set()
     old_entries = []
     old_domain = None
 
-    # Step 1: Detect run mode
     file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
     pages_to_scan = INCREMENTAL_PAGES if file_exists else FIRST_RUN_PAGES
 
@@ -230,72 +197,82 @@ def main():
                 key = extract_file_key(line)
                 if key:
                     existing_file_keys.add(key)
-                if any(ext in line for ext in ('.mkv', '.mp4', '.m3u8')) and not old_domain:
+                if 'multidownload.' in line and not old_domain:
                     clean_link = line.split('|')[0].strip()
                     old_domain = get_domain(clean_link)
 
-        print(f"📁 Loaded existing playlist: {len(existing_file_keys)} items.")
-        print(f"⚡ Mode: INCREMENTAL ({pages_to_scan} pages).")
+        print(f"📁 Loaded existing playlist: {len(existing_file_keys)} items.", flush=True)
+        print(f"⚡ Mode: INCREMENTAL ({pages_to_scan} pages).", flush=True)
     else:
-        print(f"📁 Initial run: No previous {OUTPUT_FILE} found.")
-        print(f"⚡ Mode: DEEP SCAN ({pages_to_scan} pages).")
+        print(f"📁 Initial run: No previous {OUTPUT_FILE} found.", flush=True)
+        print(f"⚡ Mode: INITIAL SCAN ({pages_to_scan} pages).", flush=True)
 
-    # Step 2: Concurrently scan category pagination
-    print(f"\nScanning pages 1 to {pages_to_scan}...")
+    # Step 1: Scan Category Pages
+    print(f"\nScanning pages 1 to {pages_to_scan}...", flush=True)
     candidate_movies = {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_page = {executor.submit(scan_single_page, p): p for p in range(1, pages_to_scan + 1)}
         for future in concurrent.futures.as_completed(future_to_page):
-            for title, post_url in future.result():
-                clean_key = post_url.rstrip('/').split('/')[-1]
-                if clean_key not in candidate_movies:
-                    candidate_movies[clean_key] = (title, post_url)
+            p_num = future_to_page[future]
+            try:
+                res = future.result()
+                print(f" -> Page {p_num} processed ({len(res)} posts found)", flush=True)
+                for title, post_url in res:
+                    clean_key = post_url.rstrip('/').split('/')[-1]
+                    if clean_key not in candidate_movies:
+                        candidate_movies[clean_key] = (title, post_url)
+            except Exception as e:
+                print(f" -> Page {p_num} error: {e}", flush=True)
 
-    print(f"   Found {len(candidate_movies)} candidate posts. Resolving watch & stream links...")
+    print(f"\nFound {len(candidate_movies)} unique posts. Resolving multicloudlinks -> multidownload...", flush=True)
 
-    # Step 3: Concurrently resolve "Watch Online" -> "Copy Stream Link"
+    # Step 2: Concurrently Resolve Links
     all_new_entries = []
     active_domain = None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(process_movie, title, url, GROUP_NAME): clean_key 
-            for clean_key, (title, url) in candidate_movies.items()
+            executor.submit(process_movie, title, url, GROUP_NAME): (title, url) 
+            for _, (title, url) in candidate_movies.items()
         }
         for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result:
-                entry, domain, file_key = result
-                if file_key not in existing_file_keys:
-                    existing_file_keys.add(file_key)
-                    all_new_entries.append(entry)
-                    print(f"   ⚡ Added: {file_key[:50]}")
-                    if not active_domain:
-                        active_domain = domain
+            title, url = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    entry, domain, file_key = result
+                    if file_key not in existing_file_keys:
+                        existing_file_keys.add(file_key)
+                        all_new_entries.append(entry)
+                        print(f"   ⚡ Added: {title[:45]}...", flush=True)
+                        if not active_domain:
+                            active_domain = domain
+            except Exception:
+                pass
 
-    # Step 4: CDN domain migration check
+    # Step 3: Domain change migration
     if old_domain and active_domain and old_domain != active_domain:
-        print(f"\n🔄 CDN change detected: {old_domain} -> {active_domain}. Updating historical entries...")
+        print(f"\n🔄 Domain update: {old_domain} -> {active_domain}", flush=True)
         old_entries_text = "".join(old_entries).replace(old_domain, active_domain)
         old_entries = [old_entries_text]
 
-    # Step 5: Save output file
+    # Step 4: Write to M3U
     ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     now = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
-    print(f"\n💾 Writing to {OUTPUT_FILE} (+{len(all_new_entries)} new entries added)...")
+    print(f"\n💾 Writing to {OUTPUT_FILE} (+{len(all_new_entries)} new entries added)...", flush=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write('#EXTM3U x-tvg-url=""\n')
         f.write(f'# Playlist Generated Automatically ({GROUP_NAME})\n')
         f.write(f'# Last Updated: {now}\n\n')
-        
+
         for entry in all_new_entries:
             f.write(entry)
-            
+
         f.write("".join(old_entries))
 
-    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.")
+    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.", flush=True)
 
 if __name__ == "__main__":
     main()
