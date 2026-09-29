@@ -13,7 +13,7 @@ CATEGORY_PATH = "/category/hollywood-hindi-movies/"
 GROUP_NAME = "Hollywood Hindi Movies"
 OUTPUT_FILE = "hollywood_hindi_movies.m3u"
 
-FIRST_RUN_PAGES = 150       # Deep scan on initial run
+FIRST_RUN_PAGES = 14       # Deep scan on initial run
 INCREMENTAL_PAGES = 5       # Fast scan on scheduled/cron runs
 MAX_WORKERS = 10
 
