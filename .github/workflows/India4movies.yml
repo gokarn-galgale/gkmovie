@@ -1,10 +1,9 @@
-name: India4movies
+name: Update M3U Playlist
 
 on:
   schedule:
-    # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+  workflow_dispatch:
 
 concurrency:
   group: m3u-update
@@ -14,11 +13,13 @@ jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Required to push playlist back to the repository
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full git history so rebase works cleanly
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,19 +33,23 @@ jobs:
           pip install beautifulsoup4 cloudscraper
 
       - name: Run Scraper
+        timeout-minutes: 25
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
-          python India4movies.py # Replace with your actual python filename if different
+          python -u India4movies.py
 
-      - name: Commit and push updated playlist
+      - name: Commit and push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          git add hollywood_hindi_movies.m3u
-          
+
+          git add *.m3u
+
           if git diff --staged --quiet; then
-            echo "No playlist updates detected."
+            echo "No updates detected in playlist. Skipping commit."
           else
             git commit -m "Auto-update playlist: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
+            git pull --rebase origin main
+            git push origin main
           fi
