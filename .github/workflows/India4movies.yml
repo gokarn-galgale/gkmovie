@@ -5,6 +5,7 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+# Prevents two runs from executing at the same time and conflicting
 concurrency:
   group: m3u-update
   cancel-in-progress: false
@@ -19,7 +20,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Full git history so rebase works cleanly
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -44,12 +45,21 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add *.m3u
+          # Backup newly generated playlist
+          cp hollywood_hindi_movies.m3u /tmp/latest_playlist.m3u
+
+          # Sync with remote main branch to avoid conflict
+          git fetch origin main
+          git reset --hard origin/main
+
+          # Restore newly generated playlist
+          cp /tmp/latest_playlist.m3u hollywood_hindi_movies.m3u
+
+          git add hollywood_hindi_movies.m3u
 
           if git diff --staged --quiet; then
             echo "No updates detected in playlist. Skipping commit."
           else
             git commit -m "Auto-update playlist: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git pull --rebase origin main
             git push origin main
           fi
