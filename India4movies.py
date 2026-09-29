@@ -13,8 +13,8 @@ CATEGORY_PATH = "/category/hollywood-hindi-movies/"
 GROUP_NAME = "Hollywood Hindi Movies"
 OUTPUT_FILE = "hollywood_hindi_movies.m3u"
 
-FIRST_RUN_PAGES = 150       # Scans 150 pages on the initial run
-INCREMENTAL_PAGES = 5       # Fast scan on scheduled/cron runs
+FIRST_RUN_PAGES = 150       # Scans 150 pages on initial deep run
+INCREMENTAL_PAGES = 5       # Fast scan on cron runs
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
 MAX_WORKERS = 10
 
@@ -38,56 +38,71 @@ def extract_file_key(url_or_line):
         return match.group(1).lower()
     return clean.rstrip('/').split('/')[-1].split('?')[0].lower()
 
-def extract_poster_from_soup(soup, page_url):
+def extract_movie_title(soup):
     """
-    Extracts poster using:
-    1. Tag containing 'HERO POSTER' (class, alt, id, or attribute) -> img src
-    2. Fallback to featured image / og:image
+    Extracts the clean title directly from the 'mp-title' class.
+    Falls back to <h1> or <title> if missing.
     """
-    # 1. Target hero poster specifically
+    # 1. Target mp-title class (div, span, h1, h2, etc.)
+    mp_elem = soup.find(class_=re.compile(r'\bmp-title\b', re.IGNORECASE))
+    if mp_elem:
+        raw_text = mp_elem.get_text(strip=True)
+        if raw_text:
+            return re.sub(r'[\r\n\t]+', ' ', raw_text).strip()
+
+    # 2. Fallback to h1 or meta title
+    h1 = soup.find('h1')
+    if h1 and h1.get_text(strip=True):
+        return re.sub(r'[\r\n\t]+', ' ', h1.get_text(strip=True)).strip()
+
+    title_tag = soup.find('title')
+    if title_tag:
+        raw = title_tag.get_text(strip=True)
+        # Basic cleanup if falling back to <title>
+        cleaned = re.split(r'[-–—|:]\s*(?:India4Movies|Watch Online|Download)', raw, flags=re.IGNORECASE)[0]
+        return cleaned.strip()
+
+    return "Unknown Movie"
+
+def extract_hero_poster(soup, page_url):
+    """
+    Extracts poster image specifically looking for 'HERO POSTER'.
+    """
     hero_img = soup.find('img', class_=re.compile(r'hero[-_]?poster', re.IGNORECASE))
     if not hero_img:
         hero_img = soup.find('img', alt=re.compile(r'hero[-_]?poster', re.IGNORECASE))
     if not hero_img:
         hero_img = soup.find('img', id=re.compile(r'hero[-_]?poster', re.IGNORECASE))
     
-    # Check parent container labeled hero poster
+    # Check parent containers labeled hero-poster
     if not hero_img:
-        hero_container = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span'] and 
-                                   any('hero-poster' in str(v).lower() or 'hero_poster' in str(v).lower() for v in tag.attrs.values()))
-        if hero_container:
-            hero_img = hero_container.find('img')
+        hero_box = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span'] and 
+                             any('hero-poster' in str(v).lower() for v in tag.attrs.values()))
+        if hero_box:
+            hero_img = hero_box.find('img')
 
     if hero_img:
         src = hero_img.get('src') or hero_img.get('data-src') or hero_img.get('data-lazy-src')
         if src:
             return urljoin(page_url, src.strip())
 
-    # Fallback to standard post image / OpenGraph image
+    # Fallback to standard post thumbnail / og:image
     post_img = soup.find('img', class_=re.compile(r'wp-post-image|attachment-post-thumbnail', re.IGNORECASE))
     if post_img:
         src = post_img.get('src') or post_img.get('data-src')
         if src:
             return urljoin(page_url, src.strip())
 
-    poster_meta = soup.find('meta', property='og:image')
-    if poster_meta and poster_meta.get('content'):
-        return urljoin(page_url, poster_meta['content'].strip())
+    og_img = soup.find('meta', property='og:image')
+    if og_img and og_img.get('content'):
+        return urljoin(page_url, og_img['content'].strip())
 
     return ""
 
-def clean_movie_title(raw_title):
-    """Cleans site names, delimiters, and trailing junk from the <title> tag."""
-    if not raw_title:
-        return "Unknown Movie"
-    # Remove standard site suffixes like ' - India4Movies', ' | Watch Online', etc.
-    cleaned = re.split(r'[-–—|:]\s*(?:India4Movies|Watch Online|Download|HD)', raw_title, flags=re.IGNORECASE)[0]
-    cleaned = re.sub(r'[\r\n\t]+', ' ', cleaned)
-    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
-    return cleaned.strip()
-
 def extract_multidownload_link(html_text, page_url):
-    """Locates the 'Copy Stream Link' (*multidownload.*)."""
+    """
+    Locates the 'Copy Stream Link' (*multidownload.*).
+    """
     soup = BeautifulSoup(html_text, 'html.parser')
 
     for a in soup.find_all(['a', 'link'], href=True):
@@ -116,16 +131,14 @@ def process_movie(post_url, group_name):
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # 1. Movie name from <title> tag
-        title_tag = soup.find('title')
-        raw_title = title_tag.get_text(strip=True) if title_tag else ""
-        movie_name = clean_movie_title(raw_title)
+        # 1. Movie name from "mp-title"
+        movie_name = extract_movie_title(soup)
 
-        # 2. Poster from HERO POSTER img src
-        poster_url = extract_poster_from_soup(soup, post_url)
+        # 2. Poster from HERO POSTER img
+        poster_url = extract_hero_poster(soup, post_url)
         poster = f"{IMAGE_PROXY}{poster_url}" if poster_url else ""
 
-        # 3. Find 'Watch Online' matching *.multicloudlinks.com
+        # 3. Find "Watch Online" link matching *.multicloudlinks.com
         multicloud_url = None
         for a in soup.find_all('a', href=True):
             href = a['href'].strip()
@@ -142,7 +155,7 @@ def process_movie(post_url, group_name):
         if not multicloud_url:
             return None
 
-        # 4. Request multicloudlinks page to get 'multidownload.*' stream link
+        # 4. Visit multicloudlinks to get multidownload.* stream link
         cloud_headers = {"Referer": post_url}
         cloud_res = scraper.get(multicloud_url, headers=cloud_headers, timeout=(6, 12))
         if cloud_res.status_code != 200:
@@ -253,7 +266,7 @@ def main():
 
     print(f"\nFound {len(candidate_urls)} unique posts. Extracting titles, hero posters & stream links...", flush=True)
 
-    # Step 2: Concurrently Resolve Title, Hero Poster, and Multidownload Link
+    # Step 2: Concurrently Resolve Title (mp-title), Hero Poster, and Multidownload Link
     all_new_entries = []
     active_domain = None
 
