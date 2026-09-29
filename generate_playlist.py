@@ -9,7 +9,10 @@ from bs4 import BeautifulSoup
 OUTPUT_FILE = "playlist.m3u"
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v")
 
-# Explicit mapping of categories to their designated target URLs
+# Get TMDb API Key from environment or hardcode it
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")  # Put your key here or in GitHub Secrets
+TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
+
 CATEGORY_SEEDS = {
     "English": [
         "http://103.225.94.27/Infobase/hdd-1/English/",
@@ -55,25 +58,62 @@ CATEGORY_SEEDS = {
     ],
 }
 
+# Cache to avoid duplicate API calls for identical titles or multi-episode series
+POSTER_CACHE = {}
+
 
 def clean_url(url: str) -> str:
-    """Strips query strings (?C=N;O=D) and anchors (#) to stop Apache listing loops."""
     parts = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def clean_search_query(raw_title: str) -> str:
+    """Strips release tags, resolutions, and brackets so TMDb search finds the title."""
+    clean = re.sub(r"\b(1080p|720p|480p|2160p|4k|bluray|web-dl|x264|x265|hevc|aac|dvdrip)\b.*", "", raw_title, flags=re.I)
+    clean = re.sub(r"\[.*?\]|\(.*?\)", "", clean)
+    clean = re.sub(r"[._]", " ", clean).strip()
+    return clean
+
+
+def get_poster_url(title: str, is_drama: bool) -> str:
+    """Fetches official poster art URL from TMDb."""
+    if not TMDB_API_KEY:
+        return ""
+
+    query = clean_search_query(title)
+    if query in POSTER_CACHE:
+        return POSTER_CACHE[query]
+
+    media_type = "tv" if is_drama else "movie"
+    url = f"https://api.themoviedb.org/3/search/{media_type}"
+    params = {"api_key": TMDB_API_KEY, "query": query}
+
+    try:
+        res = requests.get(url, params=params, timeout=4)
+        if res.status_code == 200:
+            data = res.json()
+            results = data.get("results", [])
+            if results and results[0].get("poster_path"):
+                poster_url = f"{TMDB_IMG_BASE}{results[0]['poster_path']}"
+                POSTER_CACHE[query] = poster_url
+                return poster_url
+    except Exception:
+        pass
+
+    POSTER_CACHE[query] = ""
+    return ""
+
+
 def format_title(filename: str, parent_folder: str, is_drama: bool) -> str:
-    """Decodes URL percent-encoding and formats series episodes as Show - Episode."""
     decoded_file = urllib.parse.unquote(filename)
     base_file, _ = os.path.splitext(decoded_file)
     clean_file = re.sub(r"[._]", " ", base_file).strip()
 
     if is_drama and parent_folder:
         clean_show = re.sub(r"[._]", " ", urllib.parse.unquote(parent_folder)).strip()
-        # Prevent duplicate show title if episode filename already includes it
         if clean_show.lower() not in clean_file.lower():
             return f"{clean_show} - {clean_file}"
-            
+
     return clean_file
 
 
@@ -81,8 +121,7 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
     items = []
     visited_paths = set()
     is_drama = "drama" in category.lower()
-    
-    # Queue item: (url, parent_folder_name, depth)
+
     queue = deque()
     for seed in seeds:
         normalized_seed = clean_url(seed)
@@ -92,8 +131,6 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
 
     while queue:
         curr_url, parent_folder, depth = queue.popleft()
-        
-        # Enforce maximum folder depth of 5
         if depth > 5:
             continue
 
@@ -104,7 +141,6 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
         visited_paths.add(norm_path)
 
         try:
-            # Per-request timeouts: 3s connect, 6s read
             response = session.get(curr_url, timeout=(3.0, 6.0))
             if response.status_code != 200:
                 continue
@@ -117,18 +153,12 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
         for link in soup.find_all("a", href=True):
             raw_href = link.get("href").strip()
 
-            # Ignore Apache directory parameters, anchors, and root/parent directory jumps
-            if "?" in raw_href or "#" in raw_href:
-                continue
-            if raw_href in ("../", "./", "/", ""):
-                continue
-            if "parent directory" in link.text.lower():
+            if "?" in raw_href or "#" in raw_href or raw_href in ("../", "./", "/", "") or "parent directory" in link.text.lower():
                 continue
 
             target_url = urllib.parse.urljoin(curr_url, raw_href)
             target_url = clean_url(target_url)
 
-            # Prevent stepping backwards outside the seed path
             if not any(target_url.startswith(clean_url(s).rstrip("/") + "/") or target_url == clean_url(s) for s in seeds):
                 continue
 
@@ -143,14 +173,18 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
 
             if is_video:
                 title = format_title(file_or_folder, parent_folder, is_drama)
+                # Fetch poster for the title or series folder
+                lookup_name = parent_folder if is_drama and parent_folder else title
+                poster_url = get_poster_url(lookup_name, is_drama)
+
                 items.append({
                     "title": title,
                     "url": target_url,
-                    "category": category
+                    "category": category,
+                    "logo": poster_url
                 })
-                print(f"[{category}] {title}", flush=True)
+                print(f"[{category}] {title} {'(Poster added)' if poster_url else ''}", flush=True)
             else:
-                # Sub-directory detected: keep moving down
                 current_folder_name = file_or_folder
                 if not target_url.endswith("/"):
                     target_url += "/"
@@ -163,7 +197,9 @@ def write_m3u(entries: list, filepath: str):
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n\n")
         for item in entries:
-            f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}",{item["title"]}\n')
+            # tvg-logo renders the poster in IPTV players
+            logo_attr = f' tvg-logo="{item["logo"]}"' if item["logo"] else ""
+            f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}"{logo_attr},{item["title"]}\n')
             f.write(f"{item['url']}\n\n")
     print(f"\nM3U successfully generated at {filepath} with {len(entries)} items.", flush=True)
 
