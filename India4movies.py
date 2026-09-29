@@ -60,8 +60,8 @@ def extract_movie_title(soup):
 
     return "Unknown Movie"
 
-def normalize_image_url(url):
-    """Ensures valid https:// prefix and strips trailing clutter."""
+def normalize_image_url(url, base_url):
+    """Ensures valid https:// prefix and strips trailing spaces/symbols."""
     if not url:
         return ""
     clean = url.strip()
@@ -71,66 +71,54 @@ def normalize_image_url(url):
         return clean.replace("http://", "https://", 1)
     if clean.startswith("https://"):
         return clean
-    return f"https://{clean.lstrip('/')}"
+    return urljoin(base_url, clean)
 
-def extract_india4movies_poster(soup, page_html, page_url):
+def extract_poster_from_mp_img_wrap(soup, page_url):
     """
-    Directly targets posters from image.india4movies.net:
-    1. Checks hero-poster elements and all <img> tags (lazy-load attributes & srcset).
-    2. Checks meta tags (og:image, twitter:image).
-    3. Runs regex search across the raw HTML text.
+    Extracts the poster directly from the 'mp-img-wrap' element.
+    Checks inside the container, handles lazy-loaded attributes, and falls back to srcset.
     """
-    check_attrs = ['src', 'data-src', 'data-lazy-src', 'data-orig-file', 'data-original', 'data-full-url']
-
-    # 1. Target hero poster elements first
-    hero_container = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span', 'p'] and 
-                               any('hero-poster' in str(v).lower() for v in tag.attrs.values()))
+    # 1. Target container or tag with class 'mp-img-wrap'
+    wrap = soup.find(class_=re.compile(r'\bmp-img-wrap\b', re.IGNORECASE))
     
-    candidate_imgs = []
-    if hero_container:
-        candidate_imgs.extend(hero_container.find_all('img'))
+    img = None
+    if wrap:
+        img = wrap if wrap.name == 'img' else wrap.find('img')
 
-    hero_img = soup.find('img', class_=re.compile(r'hero[-_]?poster', re.IGNORECASE))
-    if hero_img and hero_img not in candidate_imgs:
-        candidate_imgs.append(hero_img)
-
-    # Add all images on the page
-    candidate_imgs.extend(soup.find_all('img'))
-
-    for img in candidate_imgs:
+    # If an image tag is found inside mp-img-wrap
+    if img:
+        check_attrs = [
+            'src',
+            'data-src',
+            'data-lazy-src',
+            'data-orig-file',
+            'data-original',
+            'data-full-url'
+        ]
         for attr in check_attrs:
             val = img.get(attr)
-            if val and 'image.india4movies.net' in str(val).lower():
-                return normalize_image_url(val)
+            if val and not str(val).startswith('data:image'):
+                return normalize_image_url(str(val), page_url)
 
-        # Check srcset
+        # Inspect srcset if primary attributes were data-URI placeholders
         srcset = img.get('srcset') or img.get('data-srcset')
-        if srcset and 'image.india4movies.net' in srcset.lower():
-            matches = re.findall(r'(https?://image\.india4movies\.net[^\s,]+|//image\.india4movies\.net[^\s,]+)', srcset, re.IGNORECASE)
-            if matches:
-                return normalize_image_url(matches[-1])
+        if srcset:
+            urls = re.findall(r'(https?://[^\s,]+|//[^\s,]+)', srcset)
+            if urls:
+                return normalize_image_url(urls[-1], page_url)
 
-    # 2. Check meta tags
-    for prop in ['og:image', 'og:image:secure_url', 'twitter:image']:
-        meta = soup.find('meta', property=prop) or soup.find('meta', attrs={"name": prop})
-        if meta and meta.get('content') and 'image.india4movies.net' in meta['content'].lower():
-            return normalize_image_url(meta['content'].strip())
+    # 2. Fallback: Check if the mp-img-wrap container has background-image in inline style
+    if wrap and wrap.get('style'):
+        style_match = re.search(r'url\([\'"]?(https?://[^\'")]+\vert{}//[^\'")]+)[\'"]?\)', wrap['style'], re.IGNORECASE)
+        if style_match:
+            return normalize_image_url(style_match.group(1), page_url)
 
-    # 3. Regex search on raw HTML text
-    regex_matches = re.findall(r'(?:https?:)?//image\.india4movies\.net/[^\s"\'<>`)]+', page_html, re.IGNORECASE)
-    if regex_matches:
-        for link in regex_matches:
-            clean = link.rstrip('\\";,')
-            if any(ext in clean.lower() for ext in ('.jpg', '.jpeg', '.png', '.webp')):
-                return normalize_image_url(clean)
-        return normalize_image_url(regex_matches[0].rstrip('\\";,'))
-
-    # 4. Fallback: if domain changed or hosted elsewhere on site
-    for img in candidate_imgs:
-        for attr in check_attrs:
-            val = img.get(attr)
-            if val and any(ext in str(val).lower() for ext in ('.jpg', '.jpeg', '.png', '.webp')) and not str(val).startswith('data:image'):
-                return urljoin(page_url, val.strip())
+    # 3. Fallback: Search for any img whose src/data-src points to image.india4movies.net
+    for fallback_img in soup.find_all('img'):
+        for attr in ['src', 'data-src', 'data-lazy-src']:
+            val = fallback_img.get(attr)
+            if val and 'image.india4movies.net' in str(val).lower():
+                return normalize_image_url(str(val), page_url)
 
     return ""
 
@@ -169,8 +157,8 @@ def process_movie(post_url, group_name):
         # 1. Movie name from "mp-title"
         movie_name = extract_movie_title(soup)
 
-        # 2. Direct poster from image.india4movies.net (without proxy)
-        poster = extract_india4movies_poster(soup, res.text, post_url)
+        # 2. Poster directly from "mp-img-wrap"
+        poster = extract_poster_from_mp_img_wrap(soup, post_url)
 
         # 3. Find "Watch Online" link matching *.multicloudlinks.com
         multicloud_url = None
@@ -208,7 +196,7 @@ def process_movie(post_url, group_name):
 
         clean_file_key = extract_file_key(stream_link)
         
-        # PURE stream link - No Referer attached
+        # Pure stream link without Referer attached
         final_video_link = f"{stream_link}"
 
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{final_video_link}\n'
@@ -300,7 +288,7 @@ def main():
             except Exception as e:
                 print(f" -> Page {p_num} error: {e}", flush=True)
 
-    print(f"\nFound {len(candidate_urls)} unique posts. Resolving titles, posters & stream links...", flush=True)
+    print(f"\nFound {len(candidate_urls)} unique posts. Resolving mp-title, mp-img-wrap poster & stream links...", flush=True)
 
     # Step 2: Concurrently Resolve Title, Poster, and Direct Stream Link
     all_new_entries = []
@@ -328,7 +316,7 @@ def main():
         old_entries_text = "".join(old_entries).replace(old_domain, active_domain)
         old_entries = [old_entries_text]
 
-    # Step 4: Write Clean Output
+    # Step 4: Write Output File
     ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     now = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
