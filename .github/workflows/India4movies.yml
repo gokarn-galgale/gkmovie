@@ -1,11 +1,11 @@
-name: Update M3U Playlist
+name: Indo4movies
 
 on:
   schedule:
+    # Runs automatically every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
     - cron: '0 */6 * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual run button in Actions tab
 
-# Prevents two runs from executing at the same time and conflicting
 concurrency:
   group: m3u-update
   cancel-in-progress: false
@@ -14,7 +14,7 @@ jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Grants push access to save the playlist
 
     steps:
       - name: Checkout repository
@@ -34,7 +34,7 @@ jobs:
           pip install beautifulsoup4 cloudscraper
 
       - name: Run Scraper
-        timeout-minutes: 25
+        timeout-minutes: 30
         env:
           PYTHONUNBUFFERED: "1"
         run: |
@@ -45,17 +45,24 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Backup newly generated playlist
-          cp hollywood_hindi_movies.m3u /tmp/latest_playlist.m3u
+          # 1. Verify that the output playlist file exists
+          if [ ! -f all_movies.m3u ]; then
+            echo "Error: all_movies.m3u was not generated."
+            exit 1
+          fi
 
-          # Sync with remote main branch to avoid conflict
+          # 2. Backup the newly built playlist to /tmp
+          cp all_movies.m3u /tmp/all_movies_latest.m3u
+
+          # 3. Pull latest remote state to prevent conflict
           git fetch origin main
           git reset --hard origin/main
 
-          # Restore newly generated playlist
-          cp /tmp/latest_playlist.m3u hollywood_hindi_movies.m3u
+          # 4. Restore the freshly generated file back to workspace
+          cp /tmp/all_movies_latest.m3u all_movies.m3u
 
-          git add hollywood_hindi_movies.m3u
+          # 5. Stage and push if content has changed
+          git add all_movies.m3u
 
           if git diff --staged --quiet; then
             echo "No updates detected in playlist. Skipping commit."
