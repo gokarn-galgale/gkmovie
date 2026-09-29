@@ -1,10 +1,9 @@
-name: Indo4movies
+name: Update M3U Playlist
 
 on:
   schedule:
-    # Runs automatically every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
     - cron: '0 */6 * * *'
-  workflow_dispatch: # Allows manual run button in Actions tab
+  workflow_dispatch:
 
 concurrency:
   group: m3u-update
@@ -14,7 +13,7 @@ jobs:
   scrape-and-update:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Grants push access to save the playlist
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -31,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install beautifulsoup4 cloudscraper
+          pip install beautifulsoup4 cloudscraper lxml
 
       - name: Run Scraper
         timeout-minutes: 30
@@ -45,23 +44,16 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 1. Verify that the output playlist file exists
           if [ ! -f all_movies.m3u ]; then
             echo "Error: all_movies.m3u was not generated."
             exit 1
           fi
 
-          # 2. Backup the newly built playlist to /tmp
           cp all_movies.m3u /tmp/all_movies_latest.m3u
-
-          # 3. Pull latest remote state to prevent conflict
           git fetch origin main
           git reset --hard origin/main
-
-          # 4. Restore the freshly generated file back to workspace
           cp /tmp/all_movies_latest.m3u all_movies.m3u
 
-          # 5. Stage and push if content has changed
           git add all_movies.m3u
 
           if git diff --staged --quiet; then
