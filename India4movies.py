@@ -185,7 +185,7 @@ def process_movie(post_url, group_name):
                     stream_link = decoded
 
         clean_file_key = extract_file_key(stream_link)
-        final_video_link = f"{stream_link}|Referer={multicloud_url}"
+        final_video_link = f"{stream_link}"
 
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{final_video_link}\n'
         return m3u_entry, get_domain(stream_link), clean_file_key, movie_name
