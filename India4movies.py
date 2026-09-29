@@ -12,7 +12,7 @@ BASE_URL = "https://go4.india4movies.net"
 OUTPUT_FILE = "all_movies.m3u"
 
 FIRST_RUN_PAGES = 15      # Deep scan per category if no previous file exists
-INCREMENTAL_PAGES = 5       # Fast scan per category on regular cron runs
+INCREMENTAL_PAGES = 15       # Fast scan per category on regular cron runs
 MAX_WORKERS = 24            # Scaled up for higher throughput on GitHub Actions
 
 CATEGORIES = [
