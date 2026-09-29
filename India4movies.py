@@ -9,13 +9,32 @@ import cloudscraper
 
 # --- Configuration ---
 BASE_URL = "https://go4.india4movies.net"
-CATEGORY_PATH = "/category/hollywood-hindi-movies/"
-GROUP_NAME = "Hollywood Hindi Movies"
-OUTPUT_FILE = "hollywood_hindi_movies.m3u"
+OUTPUT_FILE = "all_movies.m3u"
 
-FIRST_RUN_PAGES = 14       # Deep scan on initial run
-INCREMENTAL_PAGES = 5       # Fast scan on scheduled/cron runs
+# Pages to scan per category
+FIRST_RUN_PAGES = 150       # Deep scan per category if no previous file exists
+INCREMENTAL_PAGES = 5       # Fast scan per category on regular scheduled runs
 MAX_WORKERS = 10
+
+# Multi-Category Configuration
+CATEGORIES = [
+    {
+        "group_name": "Hollywood Hindi Movies",
+        "category_path": "/category/hollywood-hindi-movies/"
+    },
+    {
+        "group_name": "Marathi Movies",
+        "category_path": "/category/marathi-movies/"
+    },
+    {
+        "group_name": "Bollywood Movies",
+        "category_path": "/category/bollywood-movies-download/"
+    },
+    {
+        "group_name": "South Dubbed Movies",
+        "category_path": "/category/south-indian-hindi-dubbed-movies/"
+    }
+]
 
 thread_local = threading.local()
 
@@ -61,7 +80,7 @@ def extract_movie_title(soup):
     return "Unknown Movie"
 
 def normalize_image_url(url, base_url):
-    """Ensures valid https:// prefix and strips trailing spaces/symbols."""
+    """Ensures valid https:// prefix and strips trailing clutter."""
     if not url:
         return ""
     clean = url.strip()
@@ -76,16 +95,13 @@ def normalize_image_url(url, base_url):
 def extract_poster_from_mp_img_wrap(soup, page_url):
     """
     Extracts the poster directly from the 'mp-img-wrap' element.
-    Checks inside the container, handles lazy-loaded attributes, and falls back to srcset.
     """
-    # 1. Target container or tag with class 'mp-img-wrap'
     wrap = soup.find(class_=re.compile(r'\bmp-img-wrap\b', re.IGNORECASE))
     
     img = None
     if wrap:
         img = wrap if wrap.name == 'img' else wrap.find('img')
 
-    # If an image tag is found inside mp-img-wrap
     if img:
         check_attrs = [
             'src',
@@ -100,20 +116,18 @@ def extract_poster_from_mp_img_wrap(soup, page_url):
             if val and not str(val).startswith('data:image'):
                 return normalize_image_url(str(val), page_url)
 
-        # Inspect srcset if primary attributes were data-URI placeholders
         srcset = img.get('srcset') or img.get('data-srcset')
         if srcset:
             urls = re.findall(r'(https?://[^\s,]+|//[^\s,]+)', srcset)
             if urls:
                 return normalize_image_url(urls[-1], page_url)
 
-    # 2. Fallback: Check if the mp-img-wrap container has background-image in inline style
     if wrap and wrap.get('style'):
         style_match = re.search(r'url\([\'"]?(https?://[^\'")]+\vert{}//[^\'")]+)[\'"]?\)', wrap['style'], re.IGNORECASE)
         if style_match:
             return normalize_image_url(style_match.group(1), page_url)
 
-    # 3. Fallback: Search for any img whose src/data-src points to image.india4movies.net
+    # Fallback: Search for any img with image.india4movies.net
     for fallback_img in soup.find_all('img'):
         for attr in ['src', 'data-src', 'data-lazy-src']:
             val = fallback_img.get(attr)
@@ -154,10 +168,10 @@ def process_movie(post_url, group_name):
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # 1. Movie name from "mp-title"
+        # 1. Title from "mp-title"
         movie_name = extract_movie_title(soup)
 
-        # 2. Poster directly from "mp-img-wrap"
+        # 2. Poster from "mp-img-wrap"
         poster = extract_poster_from_mp_img_wrap(soup, post_url)
 
         # 3. Find "Watch Online" link matching *.multicloudlinks.com
@@ -196,7 +210,7 @@ def process_movie(post_url, group_name):
 
         clean_file_key = extract_file_key(stream_link)
         
-        # Pure stream link without Referer attached
+        # Direct stream link without Referer header
         final_video_link = f"{stream_link}"
 
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{final_video_link}\n'
@@ -205,11 +219,11 @@ def process_movie(post_url, group_name):
     except Exception:
         return None
 
-def scan_single_page(page_num):
+def scan_single_page(category_path, page_num):
     if page_num == 1:
-        url = urljoin(BASE_URL, CATEGORY_PATH)
+        url = urljoin(BASE_URL, category_path)
     else:
-        url = urljoin(BASE_URL, f"{CATEGORY_PATH.rstrip('/')}/page/{page_num}/")
+        url = urljoin(BASE_URL, f"{category_path.rstrip('/')}/page/{page_num}/")
 
     scraper = get_scraper()
     found_urls = set()
@@ -240,12 +254,13 @@ def scan_single_page(page_num):
         return []
 
 def main():
-    print(f"🚀 Starting Scraper for {GROUP_NAME}...", flush=True)
+    print("🚀 Starting Multi-Category Scraper for India4Movies...", flush=True)
 
     existing_file_keys = set()
     old_entries = []
     old_domain = None
 
+    # Step 1: Check existing playlist for incremental mode
     file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
     pages_to_scan = INCREMENTAL_PAGES if file_exists else FIRST_RUN_PAGES
 
@@ -267,48 +282,49 @@ def main():
                     old_domain = get_domain(clean_link)
 
         print(f"📁 Loaded existing playlist: {len(existing_file_keys)} items.", flush=True)
-        print(f"⚡ Mode: INCREMENTAL ({pages_to_scan} pages).", flush=True)
+        print(f"⚡ Mode: INCREMENTAL ({pages_to_scan} pages per category).", flush=True)
     else:
         print(f"📁 Initial run: No previous {OUTPUT_FILE} found.", flush=True)
-        print(f"⚡ Mode: DEEP SCAN ({pages_to_scan} pages).", flush=True)
+        print(f"⚡ Mode: DEEP SCAN ({pages_to_scan} pages per category).", flush=True)
 
-    # Step 1: Scan Category Pages
-    print(f"\nScanning pages 1 to {pages_to_scan}...", flush=True)
-    candidate_urls = set()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_page = {executor.submit(scan_single_page, p): p for p in range(1, pages_to_scan + 1)}
-        for future in concurrent.futures.as_completed(future_to_page):
-            p_num = future_to_page[future]
-            try:
-                res = future.result()
-                print(f" -> Page {p_num} processed ({len(res)} posts found)", flush=True)
-                for post_url in res:
-                    candidate_urls.add(post_url)
-            except Exception as e:
-                print(f" -> Page {p_num} error: {e}", flush=True)
-
-    print(f"\nFound {len(candidate_urls)} unique posts. Resolving mp-title, mp-img-wrap poster & stream links...", flush=True)
-
-    # Step 2: Concurrently Resolve Title, Poster, and Direct Stream Link
     all_new_entries = []
     active_domain = None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_movie, url, GROUP_NAME): url for url in candidate_urls}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                result = future.result()
-                if result:
-                    entry, domain, file_key, movie_name = result
-                    if file_key not in existing_file_keys:
-                        existing_file_keys.add(file_key)
-                        all_new_entries.append(entry)
-                        print(f"   ⚡ Added: {movie_name[:45]}...", flush=True)
-                        if not active_domain:
-                            active_domain = domain
-            except Exception:
-                pass
+    # Step 2: Loop through each configured category
+    for cat in CATEGORIES:
+        group_name = cat["group_name"]
+        cat_path = cat["category_path"]
+        print(f"\n📂 Scanning Category: {group_name} ({cat_path})...", flush=True)
+
+        candidate_urls = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_page = {executor.submit(scan_single_page, cat_path, p): p for p in range(1, pages_to_scan + 1)}
+            for future in concurrent.futures.as_completed(future_to_page):
+                p_num = future_to_page[future]
+                try:
+                    res = future.result()
+                    for post_url in res:
+                        candidate_urls.add(post_url)
+                except Exception as e:
+                    print(f" -> Page {p_num} error: {e}", flush=True)
+
+        print(f"   Found {len(candidate_urls)} candidate posts for [{group_name}]. Resolving stream links...", flush=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_movie, url, group_name): url for url in candidate_urls}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    if result:
+                        entry, domain, file_key, movie_name = result
+                        if file_key not in existing_file_keys:
+                            existing_file_keys.add(file_key)
+                            all_new_entries.append(entry)
+                            print(f"   ⚡ Added [{group_name}]: {movie_name[:40]}...", flush=True)
+                            if not active_domain:
+                                active_domain = domain
+                except Exception:
+                    pass
 
     # Step 3: Domain update check
     if old_domain and active_domain and old_domain != active_domain:
@@ -316,22 +332,23 @@ def main():
         old_entries_text = "".join(old_entries).replace(old_domain, active_domain)
         old_entries = [old_entries_text]
 
-    # Step 4: Write Output File
+    # Step 4: Write all categories into single all_movies.m3u
     ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     now = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
-    print(f"\n💾 Writing to {OUTPUT_FILE} (+{len(all_new_entries)} new entries added)...", flush=True)
+    print(f"\n💾 Writing to {OUTPUT_FILE} (+{len(all_new_entries)} total new entries added)...", flush=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write('#EXTM3U x-tvg-url=""\n')
-        f.write(f'# Playlist Generated Automatically ({GROUP_NAME})\n')
+        f.write('# Playlist Generated Automatically (Hollywood, Marathi, Bollywood, South Dubbed)\n')
         f.write(f'# Last Updated: {now}\n\n')
 
+        # Newest items prepended
         for entry in all_new_entries:
             f.write(entry)
 
         f.write("".join(old_entries))
 
-    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.", flush=True)
+    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.")
 
 if __name__ == "__main__":
     main()
