@@ -1,0 +1,50 @@
+name: Update M3U Playlist
+
+on:
+  schedule:
+    # Runs every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub Actions UI
+
+concurrency:
+  group: m3u-update
+  cancel-in-progress: false
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to push playlist back to the repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install beautifulsoup4 cloudscraper
+
+      - name: Run Scraper
+        run: |
+          python india4movies.py # Replace with your actual python filename if different
+
+      - name: Commit and push updated playlist
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git add hollywood_hindi_movies.m3u
+          
+          if git diff --staged --quiet; then
+            echo "No playlist updates detected."
+          else
+            git commit -m "Auto-update playlist: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          fi
