@@ -13,10 +13,10 @@ CATEGORY_PATH = "/category/hollywood-hindi-movies/"
 GROUP_NAME = "Hollywood Hindi Movies"
 OUTPUT_FILE = "hollywood_hindi_movies.m3u"
 
-FIRST_RUN_PAGES = 15
-INCREMENTAL_PAGES = 3
+FIRST_RUN_PAGES = 150       # Scans 150 pages on the initial run
+INCREMENTAL_PAGES = 5       # Fast scan on scheduled/cron runs
 IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
-MAX_WORKERS = 8
+MAX_WORKERS = 10
 
 thread_local = threading.local()
 
@@ -38,36 +38,76 @@ def extract_file_key(url_or_line):
         return match.group(1).lower()
     return clean.rstrip('/').split('/')[-1].split('?')[0].lower()
 
+def extract_poster_from_soup(soup, page_url):
+    """
+    Extracts poster using:
+    1. Tag containing 'HERO POSTER' (class, alt, id, or attribute) -> img src
+    2. Fallback to featured image / og:image
+    """
+    # 1. Target hero poster specifically
+    hero_img = soup.find('img', class_=re.compile(r'hero[-_]?poster', re.IGNORECASE))
+    if not hero_img:
+        hero_img = soup.find('img', alt=re.compile(r'hero[-_]?poster', re.IGNORECASE))
+    if not hero_img:
+        hero_img = soup.find('img', id=re.compile(r'hero[-_]?poster', re.IGNORECASE))
+    
+    # Check parent container labeled hero poster
+    if not hero_img:
+        hero_container = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span'] and 
+                                   any('hero-poster' in str(v).lower() or 'hero_poster' in str(v).lower() for v in tag.attrs.values()))
+        if hero_container:
+            hero_img = hero_container.find('img')
+
+    if hero_img:
+        src = hero_img.get('src') or hero_img.get('data-src') or hero_img.get('data-lazy-src')
+        if src:
+            return urljoin(page_url, src.strip())
+
+    # Fallback to standard post image / OpenGraph image
+    post_img = soup.find('img', class_=re.compile(r'wp-post-image|attachment-post-thumbnail', re.IGNORECASE))
+    if post_img:
+        src = post_img.get('src') or post_img.get('data-src')
+        if src:
+            return urljoin(page_url, src.strip())
+
+    poster_meta = soup.find('meta', property='og:image')
+    if poster_meta and poster_meta.get('content'):
+        return urljoin(page_url, poster_meta['content'].strip())
+
+    return ""
+
+def clean_movie_title(raw_title):
+    """Cleans site names, delimiters, and trailing junk from the <title> tag."""
+    if not raw_title:
+        return "Unknown Movie"
+    # Remove standard site suffixes like ' - India4Movies', ' | Watch Online', etc.
+    cleaned = re.split(r'[-–—|:]\s*(?:India4Movies|Watch Online|Download|HD)', raw_title, flags=re.IGNORECASE)[0]
+    cleaned = re.sub(r'[\r\n\t]+', ' ', cleaned)
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+    return cleaned.strip()
+
 def extract_multidownload_link(html_text, page_url):
-    """
-    Finds the 'Copy Stream Link' matching *multidownload.*
-    Searches anchor tags, data attributes, onclick scripts, and raw text.
-    """
+    """Locates the 'Copy Stream Link' (*multidownload.*)."""
     soup = BeautifulSoup(html_text, 'html.parser')
 
-    # 1. Direct href checks
     for a in soup.find_all(['a', 'link'], href=True):
         href = a['href'].strip()
         if 'multidownload.' in href.lower():
             return urljoin(page_url, href)
 
-    # 2. Check attributes like data-url, data-link, data-clipboard-text, value
     for tag in soup.find_all(attrs=True):
         for attr in ['data-url', 'data-link', 'data-clipboard-text', 'data-src', 'value']:
             val = tag.attrs.get(attr)
             if isinstance(val, str) and 'multidownload.' in val.lower():
                 return urljoin(page_url, val.strip())
 
-    # 3. Regex scan for multidownload URLs inside JavaScript and raw HTML
     matches = re.findall(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', html_text, re.IGNORECASE)
     if matches:
-        # Clean potential trailing characters
-        clean_match = matches[0].rstrip('\\";),')
-        return clean_match
+        return matches[0].rstrip('\\";),')
 
     return None
 
-def process_movie(title, post_url, group_name):
+def process_movie(post_url, group_name):
     scraper = get_scraper()
     try:
         res = scraper.get(post_url, timeout=(6, 12))
@@ -76,18 +116,16 @@ def process_movie(title, post_url, group_name):
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Extract poster
-        poster = ""
-        poster_meta = soup.find('meta', property='og:image')
-        if poster_meta and poster_meta.get('content'):
-            poster = f"{IMAGE_PROXY}{poster_meta['content']}"
+        # 1. Movie name from <title> tag
+        title_tag = soup.find('title')
+        raw_title = title_tag.get_text(strip=True) if title_tag else ""
+        movie_name = clean_movie_title(raw_title)
 
-        # Clean display title
-        h1 = soup.find('h1')
-        display_name = h1.get_text(strip=True) if h1 else title
-        display_name = re.sub(r'[\r\n]+', ' ', display_name).strip()
+        # 2. Poster from HERO POSTER img src
+        poster_url = extract_poster_from_soup(soup, post_url)
+        poster = f"{IMAGE_PROXY}{poster_url}" if poster_url else ""
 
-        # Step 2: Find "Watch Online" link starting with *.multicloudlinks.com
+        # 3. Find 'Watch Online' matching *.multicloudlinks.com
         multicloud_url = None
         for a in soup.find_all('a', href=True):
             href = a['href'].strip()
@@ -95,7 +133,6 @@ def process_movie(title, post_url, group_name):
                 multicloud_url = href
                 break
 
-        # Fallback check inside iframe src if not directly in an <a> tag
         if not multicloud_url:
             for ifr in soup.find_all('iframe', src=True):
                 if 'multicloudlinks.com' in ifr['src'].lower():
@@ -105,7 +142,7 @@ def process_movie(title, post_url, group_name):
         if not multicloud_url:
             return None
 
-        # Step 3: Visit the multicloudlinks page to get the multidownload stream link
+        # 4. Request multicloudlinks page to get 'multidownload.*' stream link
         cloud_headers = {"Referer": post_url}
         cloud_res = scraper.get(multicloud_url, headers=cloud_headers, timeout=(6, 12))
         if cloud_res.status_code != 200:
@@ -115,7 +152,6 @@ def process_movie(title, post_url, group_name):
         if not stream_link:
             return None
 
-        # Clean any redirect wrappers (?url=...)
         if 'url=' in stream_link:
             param = re.search(r'url=([^&]+)', stream_link)
             if param:
@@ -126,8 +162,8 @@ def process_movie(title, post_url, group_name):
         clean_file_key = extract_file_key(stream_link)
         final_video_link = f"{stream_link}|Referer={multicloud_url}"
 
-        m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {display_name}\n{final_video_link}\n'
-        return m3u_entry, get_domain(stream_link), clean_file_key
+        m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{final_video_link}\n'
+        return m3u_entry, get_domain(stream_link), clean_file_key, movie_name
 
     except Exception:
         return None
@@ -139,7 +175,7 @@ def scan_single_page(page_num):
         url = urljoin(BASE_URL, f"{CATEGORY_PATH.rstrip('/')}/page/{page_num}/")
 
     scraper = get_scraper()
-    found_movies = []
+    found_urls = set()
     try:
         response = scraper.get(url, timeout=(6, 12))
         if response.status_code != 200:
@@ -154,23 +190,15 @@ def scan_single_page(page_num):
             for a in container.find_all('a', href=True):
                 href = a['href']
                 full_url = urljoin(BASE_URL, href)
-                text = a.get_text(strip=True)
 
                 if (
                     full_url.startswith(BASE_URL)
                     and not re.search(r'/(category|tag|author|page)/', full_url)
                     and full_url.rstrip('/') != BASE_URL.rstrip('/')
-                    and len(text) > 4
                 ):
-                    found_movies.append((text, full_url))
+                    found_urls.add(full_url)
 
-        # Deduplicate page entries
-        dedup = {}
-        for title, link in found_movies:
-            if link not in dedup:
-                dedup[link] = title
-
-        return [(t, l) for l, t in dedup.items()]
+        return list(found_urls)
     except Exception:
         return []
 
@@ -205,11 +233,11 @@ def main():
         print(f"⚡ Mode: INCREMENTAL ({pages_to_scan} pages).", flush=True)
     else:
         print(f"📁 Initial run: No previous {OUTPUT_FILE} found.", flush=True)
-        print(f"⚡ Mode: INITIAL SCAN ({pages_to_scan} pages).", flush=True)
+        print(f"⚡ Mode: DEEP SCAN ({pages_to_scan} pages).", flush=True)
 
-    # Step 1: Scan Category Pages
+    # Step 1: Scan Category Pages (1 to 150)
     print(f"\nScanning pages 1 to {pages_to_scan}...", flush=True)
-    candidate_movies = {}
+    candidate_urls = set()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_page = {executor.submit(scan_single_page, p): p for p in range(1, pages_to_scan + 1)}
@@ -218,34 +246,28 @@ def main():
             try:
                 res = future.result()
                 print(f" -> Page {p_num} processed ({len(res)} posts found)", flush=True)
-                for title, post_url in res:
-                    clean_key = post_url.rstrip('/').split('/')[-1]
-                    if clean_key not in candidate_movies:
-                        candidate_movies[clean_key] = (title, post_url)
+                for post_url in res:
+                    candidate_urls.add(post_url)
             except Exception as e:
                 print(f" -> Page {p_num} error: {e}", flush=True)
 
-    print(f"\nFound {len(candidate_movies)} unique posts. Resolving multicloudlinks -> multidownload...", flush=True)
+    print(f"\nFound {len(candidate_urls)} unique posts. Extracting titles, hero posters & stream links...", flush=True)
 
-    # Step 2: Concurrently Resolve Links
+    # Step 2: Concurrently Resolve Title, Hero Poster, and Multidownload Link
     all_new_entries = []
     active_domain = None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(process_movie, title, url, GROUP_NAME): (title, url) 
-            for _, (title, url) in candidate_movies.items()
-        }
+        futures = {executor.submit(process_movie, url, GROUP_NAME): url for url in candidate_urls}
         for future in concurrent.futures.as_completed(futures):
-            title, url = futures[future]
             try:
                 result = future.result()
                 if result:
-                    entry, domain, file_key = result
+                    entry, domain, file_key, movie_name = result
                     if file_key not in existing_file_keys:
                         existing_file_keys.add(file_key)
                         all_new_entries.append(entry)
-                        print(f"   ⚡ Added: {title[:45]}...", flush=True)
+                        print(f"   ⚡ Added: {movie_name[:45]}...", flush=True)
                         if not active_domain:
                             active_domain = domain
             except Exception:
