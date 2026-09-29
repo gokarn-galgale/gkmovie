@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import urllib.parse
 from collections import deque
 import requests
@@ -7,11 +8,28 @@ from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 OUTPUT_FILE = "playlist.m3u"
+CACHE_FILE = "poster_cache.json"
 VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".m4v")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
+
+# Options: 'w185', 'w342', 'w500', 'w780', 'original'
+POSTER_SIZE = "w500"
+BACKDROP_SIZE = "w780"
+TMDB_IMG_BASE = f"https://image.tmdb.org/t/p/{POSTER_SIZE}"
+TMDB_BACKDROP_BASE = f"https://image.tmdb.org/t/p/{BACKDROP_SIZE}"
+
+# Language priority per category
+CATEGORY_LANGUAGES = {
+    "Hindi": "hi-IN",
+    "Hindi Dubbed": "hi-IN",
+    "Hindi Drama": "hi-IN",
+    "Korean": "ko-KR",
+    "English": "en-US",
+    "English Drama": "en-US",
+    "Kids": "en-US",
+}
 
 CATEGORY_SEEDS = {
     "English": [
@@ -58,7 +76,23 @@ CATEGORY_SEEDS = {
     ],
 }
 
-POSTER_CACHE = {}
+
+def load_cache() -> dict:
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_cache(cache: dict):
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[!] Failed to save cache: {e}")
 
 
 def clean_url(url: str) -> str:
@@ -66,61 +100,92 @@ def clean_url(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def sanitize_search_query(raw_title: str) -> str:
-    """Aggressively purges scene tags, audio, codecs, and years for clean TMDb matching."""
-    text = urllib.parse.unquote(raw_title)
-    text, _ = os.path.splitext(text)
+def parse_clean_query_and_year(raw_title: str) -> tuple[str, str | None]:
+    decoded = urllib.parse.unquote(raw_title)
+    name, _ = os.path.splitext(decoded)
 
-    # Remove text in parentheses or square brackets
-    text = re.sub(r"\[.*?\]|\(.*?\)", " ", text)
+    # 4-digit release year extraction
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", name)
+    year = year_match.group(1) if year_match else None
 
-    # Cut off at common scene tags, codecs, sources, or resolutions
-    tags = (
+    name = re.sub(r"\[.*?\]|\(.*?\)", " ", name)
+
+    scene_tags = (
         r"\b(1080p|720p|480p|2160p|4k|uhd|bluray|blu-ray|web-dl|webrip|hdrip|dvdrip|"
         r"x264|x265|hevc|h264|h265|aac|ac3|dts|ddp5\.1|dual audio|hindi|english|"
-        r"esub|mkv|mp4|proper|repack|remux)\b"
+        r"esub|proper|repack|remux)\b"
     )
-    text = re.split(tags, text, flags=re.IGNORECASE)[0]
+    name = re.split(scene_tags, name, flags=re.IGNORECASE)[0]
 
-    # Remove 4-digit release years (e.g. 1999, 2024)
-    text = re.sub(r"\b(19\d\d|20\d\d)\b.*", "", text)
+    if year:
+        name = re.split(r"\b" + year + r"\b", name)[0]
 
-    # Replace dots, underscores, dashes with spaces
-    text = re.sub(r"[._\-]", " ", text).strip()
-    return text
+    clean = re.sub(r"[._\-]", " ", name).strip()
+    return clean, year
 
 
-def fetch_tmdb_poster(search_title: str, is_drama: bool) -> str:
+def fetch_advanced_posters(search_title: str, category: str, is_drama: bool, cache: dict) -> tuple[str, str]:
+    """Returns a tuple of (poster_url, backdrop_url) with multi-language fallback and caching."""
     if not TMDB_API_KEY:
-        return ""
+        return "", ""
 
-    query = sanitize_search_query(search_title)
+    query, year = parse_clean_query_and_year(search_title)
     if not query:
-        return ""
+        query = re.sub(r"[._\-]", " ", os.path.splitext(urllib.parse.unquote(search_title))[0]).strip()
 
-    cache_key = f"{'tv' if is_drama else 'movie'}:{query.lower()}"
-    if cache_key in POSTER_CACHE:
-        return POSTER_CACHE[cache_key]
+    cache_key = f"{'tv' if is_drama else 'movie'}:{query.lower()}:{year or ''}:{category}"
+    if cache_key in cache:
+        cached_data = cache[cache_key]
+        return cached_data.get("poster", ""), cached_data.get("backdrop", "")
 
     endpoint = "tv" if is_drama else "movie"
     url = f"https://api.themoviedb.org/3/search/{endpoint}"
-    params = {"api_key": TMDB_API_KEY, "query": query}
+    primary_lang = CATEGORY_LANGUAGES.get(category, "en-US")
+
+    # Try 1: Search with specific category language preference and year
+    params = {
+        "api_key": TMDB_API_KEY,
+        "query": query,
+        "language": primary_lang,
+        "include_adult": "true",
+    }
+    if year:
+        params["first_air_date_year" if is_drama else "year"] = year
 
     try:
         res = requests.get(url, params=params, timeout=5)
-        if res.status_code == 200:
-            results = res.json().get("results", [])
-            if results:
-                poster_path = results[0].get("poster_path")
-                if poster_path:
-                    full_url = f"{TMDB_IMG_BASE}{poster_path}"
-                    POSTER_CACHE[cache_key] = full_url
-                    return full_url
-    except Exception:
-        pass
+        results = res.json().get("results", []) if res.status_code == 200 else []
 
-    POSTER_CACHE[cache_key] = ""
-    return ""
+        # Try 2: Fallback to English and drop year constraint if no poster returned
+        if not results:
+            params.pop("year", None)
+            params.pop("first_air_date_year", None)
+            params["language"] = "en-US"
+            res2 = requests.get(url, params=params, timeout=5)
+            results = res2.json().get("results", []) if res2.status_code == 200 else []
+
+        # Try 3: Multi-search fallback
+        if not results:
+            multi_url = "https://api.themoviedb.org/3/search/multi"
+            res3 = requests.get(multi_url, params={"api_key": TMDB_API_KEY, "query": query, "include_adult": "true"}, timeout=5)
+            results = res3.json().get("results", []) if res3.status_code == 200 else []
+
+        if results:
+            best_match = results[0]
+            poster_path = best_match.get("poster_path")
+            backdrop_path = best_match.get("backdrop_path")
+
+            poster_url = f"{TMDB_IMG_BASE}{poster_path}" if poster_path else ""
+            backdrop_url = f"{TMDB_BACKDROP_BASE}{backdrop_path}" if backdrop_path else ""
+
+            cache[cache_key] = {"poster": poster_url, "backdrop": backdrop_url}
+            return poster_url, backdrop_url
+
+    except Exception as err:
+        print(f"    [!] Poster lookup error for '{query}': {err}", flush=True)
+
+    cache[cache_key] = {"poster": "", "backdrop": ""}
+    return "", ""
 
 
 def format_title(filename: str, parent_folder: str, is_drama: bool) -> str:
@@ -135,7 +200,7 @@ def format_title(filename: str, parent_folder: str, is_drama: bool) -> str:
     return clean_f
 
 
-def crawl_category(category: str, seeds: list, session: requests.Session) -> list:
+def crawl_category(category: str, seeds: list, session: requests.Session, cache: dict) -> list:
     items = []
     visited_paths = set()
     is_drama = "drama" in category.lower()
@@ -167,14 +232,12 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
             continue
 
         soup = BeautifulSoup(html_text, "html.parser")
-        links = soup.find_all("a", href=True)
 
-        # 1. First pass: look for any local poster/image files in this directory
         local_images = []
         video_links = []
         subfolder_links = []
 
-        for link in links:
+        for link in soup.find_all("a", href=True):
             raw_href = link.get("href").strip()
             if "?" in raw_href or "#" in raw_href or raw_href in ("../", "./", "/", "") or "parent directory" in link.text.lower():
                 continue
@@ -189,7 +252,7 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
             else:
                 subfolder_links.append((target_url, os.path.basename(target_norm)))
 
-        # Pick default directory poster if available (e.g. poster.jpg, folder.jpg)
+        # Identify local folder artwork
         default_dir_poster = ""
         for img in local_images:
             img_lower = img.lower()
@@ -199,34 +262,32 @@ def crawl_category(category: str, seeds: list, session: requests.Session) -> lis
         if not default_dir_poster and local_images:
             default_dir_poster = local_images[0]
 
-        # 2. Second pass: process video files
         for vid_url, filename in video_links:
             title = format_title(filename, parent_folder, is_drama)
             poster = default_dir_poster
+            backdrop = ""
 
-            # Check if there is an image specifically sharing the movie filename
             base_vid = os.path.splitext(filename)[0].lower()
             for img in local_images:
                 if base_vid in img.lower():
                     poster = img
                     break
 
-            # If no local poster exists, fetch from TMDb
             if not poster:
                 query_name = parent_folder if is_drama and parent_folder else filename
-                poster = fetch_tmdb_poster(query_name, is_drama)
+                poster, backdrop = fetch_advanced_posters(query_name, category, is_drama, cache)
 
-            status = "✓ Poster" if poster else "✗ No Poster"
-            print(f"[{category}] {title} -> {status}", flush=True)
+            status = f"✓ Poster [{poster[:42]}...]" if poster else "✗ No Poster"
+            print(f"  [{category}] {title} -> {status}", flush=True)
 
             items.append({
                 "title": title,
                 "url": vid_url,
                 "category": category,
-                "logo": poster
+                "logo": poster,
+                "backdrop": backdrop
             })
 
-        # 3. Queue subfolders
         for sub_url, folder_name in subfolder_links:
             if not any(sub_url.startswith(clean_url(s).rstrip("/") + "/") or sub_url == clean_url(s) for s in seeds):
                 continue
@@ -242,17 +303,16 @@ def write_m3u(entries: list, filepath: str):
         f.write("#EXTM3U\n\n")
         for item in entries:
             logo_attr = f' tvg-logo="{item["logo"]}"' if item["logo"] else ""
-            f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}"{logo_attr},{item["title"]}\n')
+            # tvg-banner provides horizontal background art in supported IPTV apps
+            banner_attr = f' tvg-banner="{item["backdrop"]}"' if item.get("backdrop") else ""
+            f.write(f'#EXTINF:-1 group-title="{item["category"]}" tvg-name="{item["title"]}"{logo_attr}{banner_attr},{item["title"]}\n')
             f.write(f"{item['url']}\n\n")
     print(f"\nM3U written to {filepath} with {len(entries)} items.", flush=True)
 
 
 def main():
-    if not TMDB_API_KEY:
-        print("[!] NOTICE: TMDB_API_KEY secret is EMPTY or NOT FOUND in environment.")
-        print("    TMDb lookups will be skipped. Only local server images will be used.\n")
-    else:
-        print("[+] TMDB_API_KEY detected. Online poster fetching enabled.\n")
+    poster_cache = load_cache()
+    print(f"[+] Loaded {len(poster_cache)} cached posters from {CACHE_FILE}.", flush=True)
 
     session = requests.Session()
     adapter = HTTPAdapter(max_retries=0, pool_connections=15, pool_maxsize=15)
@@ -266,9 +326,10 @@ def main():
     all_videos = []
     for category, seeds in CATEGORY_SEEDS.items():
         print(f"\n--- Scanning Category: {category} ---", flush=True)
-        category_videos = crawl_category(category, seeds, session)
+        category_videos = crawl_category(category, seeds, session, poster_cache)
         all_videos.extend(category_videos)
 
+    save_cache(poster_cache)
     all_videos.sort(key=lambda x: (x["category"], x["title"].lower()))
     write_m3u(all_videos, OUTPUT_FILE)
 
