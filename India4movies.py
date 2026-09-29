@@ -11,30 +11,23 @@ import cloudscraper
 BASE_URL = "https://go4.india4movies.net"
 OUTPUT_FILE = "all_movies.m3u"
 
-# Pages to scan per category
 FIRST_RUN_PAGES = 150       # Deep scan per category if no previous file exists
-INCREMENTAL_PAGES = 5       # Fast scan per category on regular scheduled runs
-MAX_WORKERS = 10
+INCREMENTAL_PAGES = 5       # Fast scan per category on regular cron runs
+MAX_WORKERS = 24            # Scaled up for higher throughput on GitHub Actions
 
-# Multi-Category Configuration
 CATEGORIES = [
-    {
-        "group_name": "Hollywood Hindi Movies",
-        "category_path": "/category/hollywood-hindi-movies/"
-    },
-    {
-        "group_name": "Marathi Movies",
-        "category_path": "/category/marathi-movies/"
-    },
-    {
-        "group_name": "Bollywood Movies",
-        "category_path": "/category/bollywood-movies-download/"
-    },
-    {
-        "group_name": "South Dubbed Movies",
-        "category_path": "/category/south-indian-hindi-dubbed-movies/"
-    }
+    {"group_name": "Hollywood Hindi Movies", "category_path": "/category/hollywood-hindi-movies/"},
+    {"group_name": "Marathi Movies", "category_path": "/category/marathi-movies/"},
+    {"group_name": "Bollywood Movies", "category_path": "/category/bollywood-movies-download/"},
+    {"group_name": "South Dubbed Movies", "category_path": "/category/south-indian-hindi-dubbed-movies/"}
 ]
+
+# Fast parser check (lxml is 3-5x faster than html.parser)
+try:
+    import lxml
+    HTML_PARSER = "lxml"
+except ImportError:
+    HTML_PARSER = "html.parser"
 
 thread_local = threading.local()
 
@@ -57,10 +50,6 @@ def extract_file_key(url_or_line):
     return clean.rstrip('/').split('/')[-1].split('?')[0].lower()
 
 def extract_movie_title(soup):
-    """
-    Extracts the clean title directly from the 'mp-title' element.
-    Falls back to <h1> or <title> if missing.
-    """
     mp_elem = soup.find(class_=re.compile(r'\bmp-title\b', re.IGNORECASE))
     if mp_elem:
         raw_text = mp_elem.get_text(strip=True)
@@ -80,7 +69,6 @@ def extract_movie_title(soup):
     return "Unknown Movie"
 
 def normalize_image_url(url, base_url):
-    """Ensures valid https:// prefix and strips trailing clutter."""
     if not url:
         return ""
     clean = url.strip()
@@ -93,25 +81,13 @@ def normalize_image_url(url, base_url):
     return urljoin(base_url, clean)
 
 def extract_poster_from_mp_img_wrap(soup, page_url):
-    """
-    Extracts the poster directly from the 'mp-img-wrap' element.
-    """
     wrap = soup.find(class_=re.compile(r'\bmp-img-wrap\b', re.IGNORECASE))
-    
     img = None
     if wrap:
         img = wrap if wrap.name == 'img' else wrap.find('img')
 
     if img:
-        check_attrs = [
-            'src',
-            'data-src',
-            'data-lazy-src',
-            'data-orig-file',
-            'data-original',
-            'data-full-url'
-        ]
-        for attr in check_attrs:
+        for attr in ['src', 'data-src', 'data-lazy-src', 'data-orig-file', 'data-original']:
             val = img.get(attr)
             if val and not str(val).startswith('data:image'):
                 return normalize_image_url(str(val), page_url)
@@ -127,7 +103,7 @@ def extract_poster_from_mp_img_wrap(soup, page_url):
         if style_match:
             return normalize_image_url(style_match.group(1), page_url)
 
-    # Fallback: Search for any img with image.india4movies.net
+    # Fast fallback: search for image.india4movies.net
     for fallback_img in soup.find_all('img'):
         for attr in ['src', 'data-src', 'data-lazy-src']:
             val = fallback_img.get(attr)
@@ -136,16 +112,18 @@ def extract_poster_from_mp_img_wrap(soup, page_url):
 
     return ""
 
-def extract_multidownload_link(html_text, page_url):
-    """
-    Locates the 'Copy Stream Link' (*multidownload.*).
-    """
-    soup = BeautifulSoup(html_text, 'html.parser')
+def fast_extract_multidownload_link(html_text, page_url):
+    """Bypasses full DOM parsing for ultra-fast regex-first extraction."""
+    # Fast regex match on multidownload URL
+    matches = re.findall(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', html_text, re.IGNORECASE)
+    if matches:
+        return matches[0].rstrip('\\";),')
 
+    # DOM search fallback if regex misses
+    soup = BeautifulSoup(html_text, HTML_PARSER)
     for a in soup.find_all(['a', 'link'], href=True):
-        href = a['href'].strip()
-        if 'multidownload.' in href.lower():
-            return urljoin(page_url, href)
+        if 'multidownload.' in a['href'].lower():
+            return urljoin(page_url, a['href'].strip())
 
     for tag in soup.find_all(attrs=True):
         for attr in ['data-url', 'data-link', 'data-clipboard-text', 'data-src', 'value']:
@@ -153,51 +131,46 @@ def extract_multidownload_link(html_text, page_url):
             if isinstance(val, str) and 'multidownload.' in val.lower():
                 return urljoin(page_url, val.strip())
 
-    matches = re.findall(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', html_text, re.IGNORECASE)
-    if matches:
-        return matches[0].rstrip('\\";),')
-
     return None
 
 def process_movie(post_url, group_name):
     scraper = get_scraper()
     try:
-        res = scraper.get(post_url, timeout=(6, 12))
+        res = scraper.get(post_url, timeout=(4, 8))
         if res.status_code != 200:
             return None
 
-        soup = BeautifulSoup(res.text, 'html.parser')
+        # 1. Fast regex check for multicloudlinks directly from HTML before DOM parsing
+        multicloud_matches = re.findall(r'https?://[^\s"\'<>`]*multicloudlinks\.com[^\s"\'<>`]*', res.text, re.IGNORECASE)
+        multicloud_url = multicloud_matches[0].rstrip('\\";),') if multicloud_matches else None
 
-        # 1. Title from "mp-title"
+        soup = BeautifulSoup(res.text, HTML_PARSER)
+        
+        # 2. Extract Title and Poster
         movie_name = extract_movie_title(soup)
-
-        # 2. Poster from "mp-img-wrap"
         poster = extract_poster_from_mp_img_wrap(soup, post_url)
 
-        # 3. Find "Watch Online" link matching *.multicloudlinks.com
-        multicloud_url = None
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            if 'multicloudlinks.com' in href.lower():
-                multicloud_url = href
-                break
+        if not multicloud_url:
+            for a in soup.find_all('a', href=True):
+                if 'multicloudlinks.com' in a['href'].lower():
+                    multicloud_url = a['href'].strip()
+                    break
 
         if not multicloud_url:
             for ifr in soup.find_all('iframe', src=True):
                 if 'multicloudlinks.com' in ifr['src'].lower():
-                    multicloud_url = ifr['src']
+                    multicloud_url = ifr['src'].strip()
                     break
 
         if not multicloud_url:
             return None
 
-        # 4. Visit multicloudlinks to get the multidownload stream link
-        cloud_headers = {"Referer": post_url}
-        cloud_res = scraper.get(multicloud_url, headers=cloud_headers, timeout=(6, 12))
+        # 3. Fast hop to multicloudlinks
+        cloud_res = scraper.get(multicloud_url, headers={"Referer": post_url}, timeout=(4, 8))
         if cloud_res.status_code != 200:
             return None
 
-        stream_link = extract_multidownload_link(cloud_res.text, multicloud_url)
+        stream_link = fast_extract_multidownload_link(cloud_res.text, multicloud_url)
         if not stream_link:
             return None
 
@@ -209,11 +182,7 @@ def process_movie(post_url, group_name):
                     stream_link = decoded
 
         clean_file_key = extract_file_key(stream_link)
-        
-        # Direct stream link without Referer header
-        final_video_link = f"{stream_link}"
-
-        m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{final_video_link}\n'
+        m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {movie_name}\n{stream_link}\n'
         return m3u_entry, get_domain(stream_link), clean_file_key, movie_name
 
     except Exception:
@@ -228,11 +197,11 @@ def scan_single_page(category_path, page_num):
     scraper = get_scraper()
     found_urls = set()
     try:
-        response = scraper.get(url, timeout=(6, 12))
+        response = scraper.get(url, timeout=(4, 8))
         if response.status_code != 200:
             return []
 
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, HTML_PARSER)
         posts = soup.find_all(['article', 'div'], class_=re.compile(r'(post|item|movie|film|entry)', re.IGNORECASE))
         if not posts:
             posts = [soup]
@@ -241,7 +210,6 @@ def scan_single_page(category_path, page_num):
             for a in container.find_all('a', href=True):
                 href = a['href']
                 full_url = urljoin(BASE_URL, href)
-
                 if (
                     full_url.startswith(BASE_URL)
                     and not re.search(r'/(category|tag|author|page)/', full_url)
@@ -254,13 +222,12 @@ def scan_single_page(category_path, page_num):
         return []
 
 def main():
-    print("🚀 Starting Multi-Category Scraper for India4Movies...", flush=True)
+    print(f"🚀 Starting High-Speed Scraper (Workers: {MAX_WORKERS}, Parser: {HTML_PARSER})...", flush=True)
 
     existing_file_keys = set()
     old_entries = []
     old_domain = None
 
-    # Step 1: Check existing playlist for incremental mode
     file_exists = os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0
     pages_to_scan = INCREMENTAL_PAGES if file_exists else FIRST_RUN_PAGES
 
@@ -289,42 +256,51 @@ def main():
 
     all_new_entries = []
     active_domain = None
+    lock = threading.Lock()
 
-    # Step 2: Loop through each configured category
-    for cat in CATEGORIES:
-        group_name = cat["group_name"]
-        cat_path = cat["category_path"]
-        print(f"\n📂 Scanning Category: {group_name} ({cat_path})...", flush=True)
+    # Step 2: Concurrently scan all category pages AND stream movie resolution
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as movie_executor:
+        movie_futures = []
 
-        candidate_urls = set()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_page = {executor.submit(scan_single_page, cat_path, p): p for p in range(1, pages_to_scan + 1)}
-            for future in concurrent.futures.as_completed(future_to_page):
-                p_num = future_to_page[future]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as page_executor:
+            # Queue all page scans across all 4 categories simultaneously
+            page_tasks = {
+                page_executor.submit(scan_single_page, cat["category_path"], p): cat["group_name"]
+                for cat in CATEGORIES
+                for p in range(1, pages_to_scan + 1)
+            }
+
+            discovered_urls = set()
+            for page_fut in concurrent.futures.as_completed(page_tasks):
+                group_name = page_tasks[page_fut]
                 try:
-                    res = future.result()
-                    for post_url in res:
-                        candidate_urls.add(post_url)
-                except Exception as e:
-                    print(f" -> Page {p_num} error: {e}", flush=True)
+                    urls = page_fut.result()
+                    for u in urls:
+                        if u not in discovered_urls:
+                            discovered_urls.add(u)
+                            # Immediately schedule movie scraping as soon as a link is found
+                            mf = movie_executor.submit(process_movie, u, group_name)
+                            movie_futures.append(mf)
+                except Exception:
+                    pass
 
-        print(f"   Found {len(candidate_urls)} candidate posts for [{group_name}]. Resolving stream links...", flush=True)
+        print(f"\n⚡ Discovered {len(discovered_urls)} candidates. Processing streams...", flush=True)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(process_movie, url, group_name): url for url in candidate_urls}
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    if result:
-                        entry, domain, file_key, movie_name = result
+        # Collect movie results as they complete
+        for future in concurrent.futures.as_completed(movie_futures):
+            try:
+                result = future.result()
+                if result:
+                    entry, domain, file_key, movie_name = result
+                    with lock:
                         if file_key not in existing_file_keys:
                             existing_file_keys.add(file_key)
                             all_new_entries.append(entry)
-                            print(f"   ⚡ Added [{group_name}]: {movie_name[:40]}...", flush=True)
+                            print(f"   ⚡ Added: {movie_name[:45]}...", flush=True)
                             if not active_domain:
                                 active_domain = domain
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
     # Step 3: Domain update check
     if old_domain and active_domain and old_domain != active_domain:
@@ -332,7 +308,7 @@ def main():
         old_entries_text = "".join(old_entries).replace(old_domain, active_domain)
         old_entries = [old_entries_text]
 
-    # Step 4: Write all categories into single all_movies.m3u
+    # Step 4: Write Output File
     ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     now = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
@@ -342,13 +318,12 @@ def main():
         f.write('# Playlist Generated Automatically (Hollywood, Marathi, Bollywood, South Dubbed)\n')
         f.write(f'# Last Updated: {now}\n\n')
 
-        # Newest items prepended
         for entry in all_new_entries:
             f.write(entry)
 
         f.write("".join(old_entries))
 
-    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.")
+    print(f"🎉 Complete! Updated {OUTPUT_FILE} successfully.", flush=True)
 
 if __name__ == "__main__":
     main()
