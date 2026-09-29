@@ -13,9 +13,8 @@ CATEGORY_PATH = "/category/hollywood-hindi-movies/"
 GROUP_NAME = "Hollywood Hindi Movies"
 OUTPUT_FILE = "hollywood_hindi_movies.m3u"
 
-FIRST_RUN_PAGES = 150       # Scans 150 pages on initial deep run
-INCREMENTAL_PAGES = 5       # Fast scan on cron runs
-IMAGE_PROXY = "https://srhady-live-stream.hf.space/image?url="
+FIRST_RUN_PAGES = 150       # Deep scan on initial run
+INCREMENTAL_PAGES = 5       # Fast scan on scheduled/cron runs
 MAX_WORKERS = 10
 
 thread_local = threading.local()
@@ -43,14 +42,12 @@ def extract_movie_title(soup):
     Extracts the clean title directly from the 'mp-title' class.
     Falls back to <h1> or <title> if missing.
     """
-    # 1. Target mp-title class (div, span, h1, h2, etc.)
     mp_elem = soup.find(class_=re.compile(r'\bmp-title\b', re.IGNORECASE))
     if mp_elem:
         raw_text = mp_elem.get_text(strip=True)
         if raw_text:
             return re.sub(r'[\r\n\t]+', ' ', raw_text).strip()
 
-    # 2. Fallback to h1 or meta title
     h1 = soup.find('h1')
     if h1 and h1.get_text(strip=True):
         return re.sub(r'[\r\n\t]+', ' ', h1.get_text(strip=True)).strip()
@@ -58,44 +55,60 @@ def extract_movie_title(soup):
     title_tag = soup.find('title')
     if title_tag:
         raw = title_tag.get_text(strip=True)
-        # Basic cleanup if falling back to <title>
         cleaned = re.split(r'[-–—|:]\s*(?:India4Movies|Watch Online|Download)', raw, flags=re.IGNORECASE)[0]
         return cleaned.strip()
 
     return "Unknown Movie"
 
-def extract_hero_poster(soup, page_url):
+def extract_india4movies_poster(soup, page_html, page_url):
     """
-    Extracts poster image specifically looking for 'HERO POSTER'.
+    Directly extracts the poster matching 'image.india4movies.net'.
+    Checks hero-poster first, all <img> attributes, and raw HTML regex.
     """
-    hero_img = soup.find('img', class_=re.compile(r'hero[-_]?poster', re.IGNORECASE))
-    if not hero_img:
-        hero_img = soup.find('img', alt=re.compile(r'hero[-_]?poster', re.IGNORECASE))
-    if not hero_img:
-        hero_img = soup.find('img', id=re.compile(r'hero[-_]?poster', re.IGNORECASE))
+    # 1. Target hero poster elements first
+    hero_container = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span', 'p'] and 
+                               any('hero-poster' in str(v).lower() for v in tag.attrs.values()))
     
-    # Check parent containers labeled hero-poster
-    if not hero_img:
-        hero_box = soup.find(lambda tag: tag.name in ['div', 'section', 'figure', 'span'] and 
-                             any('hero-poster' in str(v).lower() for v in tag.attrs.values()))
-        if hero_box:
-            hero_img = hero_box.find('img')
+    candidate_imgs = []
+    if hero_container:
+        candidate_imgs.extend(hero_container.find_all('img'))
+    
+    hero_img = soup.find('img', class_=re.compile(r'hero[-_]?poster', re.IGNORECASE))
+    if hero_img and hero_img not in candidate_imgs:
+        candidate_imgs.append(hero_img)
 
-    if hero_img:
-        src = hero_img.get('src') or hero_img.get('data-src') or hero_img.get('data-lazy-src')
-        if src:
-            return urljoin(page_url, src.strip())
+    # Add all other images on the page as secondary candidates
+    candidate_imgs.extend(soup.find_all('img'))
 
-    # Fallback to standard post thumbnail / og:image
-    post_img = soup.find('img', class_=re.compile(r'wp-post-image|attachment-post-thumbnail', re.IGNORECASE))
-    if post_img:
-        src = post_img.get('src') or post_img.get('data-src')
-        if src:
-            return urljoin(page_url, src.strip())
+    # Check image attributes for image.india4movies.net
+    check_attrs = ['src', 'data-src', 'data-lazy-src', 'data-orig-file', 'data-original', 'data-full-url']
+    for img in candidate_imgs:
+        for attr in check_attrs:
+            val = img.get(attr)
+            if val and 'image.india4movies.net' in val.lower():
+                return urljoin(page_url, val.strip())
 
-    og_img = soup.find('meta', property='og:image')
-    if og_img and og_img.get('content'):
-        return urljoin(page_url, og_img['content'].strip())
+        # Check srcset attribute if present
+        srcset = img.get('srcset') or img.get('data-srcset')
+        if srcset and 'image.india4movies.net' in srcset.lower():
+            matches = re.findall(r'https?://image\.india4movies\.net[^\s,]+', srcset, re.IGNORECASE)
+            if matches:
+                return matches[-1]  # Highest resolution is usually last
+
+    # 2. Check OpenGraph and Twitter Meta Tags
+    for prop in ['og:image', 'og:image:secure_url', 'twitter:image']:
+        meta = soup.find('meta', property=prop) or soup.find('meta', attrs={"name": prop})
+        if meta and meta.get('content') and 'image.india4movies.net' in meta['content'].lower():
+            return meta['content'].strip()
+
+    # 3. Regex scan across full HTML source as final fallback
+    regex_matches = re.findall(r'https?://image\.india4movies\.net/[^\s"\'<>`)]+', page_html, re.IGNORECASE)
+    if regex_matches:
+        # Prefer direct image file extensions if multiple links match
+        for link in regex_matches:
+            if any(ext in link.lower() for ext in ('.jpg', '.jpeg', '.png', '.webp')):
+                return link.rstrip('\\";,')
+        return regex_matches[0].rstrip('\\";,')
 
     return ""
 
@@ -134,9 +147,8 @@ def process_movie(post_url, group_name):
         # 1. Movie name from "mp-title"
         movie_name = extract_movie_title(soup)
 
-        # 2. Poster from HERO POSTER img
-        poster_url = extract_hero_poster(soup, post_url)
-        poster = f"{IMAGE_PROXY}{poster_url}" if poster_url else ""
+        # 2. Direct poster from image.india4movies.net (No Proxy)
+        poster = extract_india4movies_poster(soup, res.text, post_url)
 
         # 3. Find "Watch Online" link matching *.multicloudlinks.com
         multicloud_url = None
@@ -155,7 +167,7 @@ def process_movie(post_url, group_name):
         if not multicloud_url:
             return None
 
-        # 4. Visit multicloudlinks to get multidownload.* stream link
+        # 4. Visit multicloudlinks to extract the multidownload.* stream link
         cloud_headers = {"Referer": post_url}
         cloud_res = scraper.get(multicloud_url, headers=cloud_headers, timeout=(6, 12))
         if cloud_res.status_code != 200:
@@ -264,9 +276,9 @@ def main():
             except Exception as e:
                 print(f" -> Page {p_num} error: {e}", flush=True)
 
-    print(f"\nFound {len(candidate_urls)} unique posts. Extracting titles, hero posters & stream links...", flush=True)
+    print(f"\nFound {len(candidate_urls)} unique posts. Resolving titles, posters & stream links...", flush=True)
 
-    # Step 2: Concurrently Resolve Title (mp-title), Hero Poster, and Multidownload Link
+    # Step 2: Concurrently Resolve Title, Poster (image.india4movies.net), and Stream Link
     all_new_entries = []
     active_domain = None
 
@@ -286,7 +298,7 @@ def main():
             except Exception:
                 pass
 
-    # Step 3: Domain change migration
+    # Step 3: Domain update check
     if old_domain and active_domain and old_domain != active_domain:
         print(f"\n🔄 Domain update: {old_domain} -> {active_domain}", flush=True)
         old_entries_text = "".join(old_entries).replace(old_domain, active_domain)
