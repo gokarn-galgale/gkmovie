@@ -2,8 +2,8 @@ name: Generate Movie Playlist
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Runs every 6 hours
-  workflow_dispatch:        # Manual run trigger via GitHub UI
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
