@@ -39,14 +39,14 @@ def process_movie(movie_url, group_name):
 
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Step 2: Get .mp-title
+        # Step 2: Extract movie title
         title_elem = soup.select_one('.mp-title')
         if not title_elem:
             title_elem = soup.find('h1')
         title = title_elem.get_text(strip=True) if title_elem else "Unknown Movie"
         title = re.sub(r'[\r\n\t]+', ' ', title).strip()
 
-        # Step 3: Get .mp-img-wrap
+        # Step 3: Extract poster image
         poster = ""
         img_wrap = soup.select_one('.mp-img-wrap')
         if img_wrap:
@@ -56,7 +56,7 @@ def process_movie(movie_url, group_name):
                 if poster.startswith('//'):
                     poster = f"https:{poster}"
 
-        # Step 4: Fetch multicloudlinks.com URL
+        # Step 4: Locate multicloudlinks.com URL
         multicloud_url = None
         cloud_match = re.search(r'https?://[^\s"\'<>`]*multicloudlinks\.com[^\s"\'<>`]*', res.text, re.IGNORECASE)
         if cloud_match:
@@ -71,7 +71,7 @@ def process_movie(movie_url, group_name):
         if not multicloud_url:
             return None
 
-        # Step 5: Fetch multidownload link from multicloudlinks page
+        # Step 5: Extract final stream/download link from multicloudlinks
         cloud_res = scraper.get(multicloud_url, headers={"Referer": movie_url}, timeout=(5, 10))
         if cloud_res.status_code != 200:
             return None
@@ -85,7 +85,6 @@ def process_movie(movie_url, group_name):
                 if param:
                     stream_link = unquote(param.group(1))
         else:
-            # Fallback DOM check inside multicloudlinks
             cloud_soup = BeautifulSoup(cloud_res.text, 'html.parser')
             for a in cloud_soup.find_all(['a', 'link'], href=True):
                 if 'multidownload.' in a['href'].lower():
@@ -95,7 +94,6 @@ def process_movie(movie_url, group_name):
         if not stream_link:
             return None
 
-        # Format clean M3U block
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{group_name}", {title}\n{stream_link}\n'
         return m3u_entry, title
 
@@ -105,7 +103,8 @@ def process_movie(movie_url, group_name):
 def scan_category_page(category_path, page_num):
     url = urljoin(BASE_URL, category_path) if page_num == 1 else urljoin(BASE_URL, f"{category_path.rstrip('/')}/page/{page_num}/")
     scraper = get_scraper()
-    movie_links = set()
+    movie_links = []
+    seen_on_page = set()
 
     try:
         res = scraper.get(url, timeout=(5, 10))
@@ -113,44 +112,65 @@ def scan_category_page(category_path, page_num):
             return []
 
         soup = BeautifulSoup(res.text, 'html.parser')
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            full = urljoin(BASE_URL, href)
-            # Ensure it is a movie post link, not pagination, tag, or category
-            if full.startswith(BASE_URL) and not re.search(r'/(category|tag|author|page)/', full, re.IGNORECASE):
-                if full.rstrip('/') != BASE_URL.rstrip('/'):
-                    movie_links.add(full)
 
-        return list(movie_links)
+        # Target movie post cards specifically (supports standard themes and fallbacks)
+        post_items = soup.select(
+            '.thumb-content, .item-list, article.post, .mp-post, .thumb, div[class*="movie-item"], div[class*="post-item"]'
+        )
+
+        if post_items:
+            for item in post_items:
+                link_tag = item.find('a', href=True)
+                if link_tag:
+                    full = urljoin(BASE_URL, link_tag['href'].strip())
+                    if full not in seen_on_page and not re.search(r'/(category|tag|author|page)/', full, re.IGNORECASE):
+                        seen_on_page.add(full)
+                        movie_links.append(full)
+        else:
+            # Fallback for alternative structures inside the main container
+            main_container = soup.select_one('#content, #main, .site-main, .movies-list, body')
+            if main_container:
+                for a in main_container.find_all('a', href=True):
+                    full = urljoin(BASE_URL, a['href'].strip())
+                    if full.startswith(BASE_URL) and not re.search(r'/(category|tag|author|page|dmca|contact|about)/', full, re.IGNORECASE):
+                        if full.rstrip('/') != BASE_URL.rstrip('/') and full not in seen_on_page:
+                            seen_on_page.add(full)
+                            movie_links.append(full)
+
+        return movie_links
     except Exception:
         return []
 
 def main():
-    print(f"🚀 Starting Scraper ({PAGES_PER_CATEGORY} pages per category)...", flush=True)
+    print(f"🚀 Starting Scraper ({len(CATEGORIES)} categories × {PAGES_PER_CATEGORY} pages = {len(CATEGORIES) * PAGES_PER_CATEGORY * 24} expected movies)...", flush=True)
 
     discovered_movies = []
     seen_urls = set()
 
-    # Phase 1: Collect movie URLs (15 pages per category)
+    # Phase 1: Collect movie URLs (preserve category & page order)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as page_executor:
-        page_tasks = {
-            page_executor.submit(scan_category_page, cat["category_path"], p): cat["group_name"]
+        future_map = {
+            page_executor.submit(scan_category_page, cat["category_path"], p): (cat["group_name"], p)
             for cat in CATEGORIES
             for p in range(1, PAGES_PER_CATEGORY + 1)
         }
 
-        for fut in concurrent.futures.as_completed(page_tasks):
-            group_name = page_tasks[fut]
+        # Sort tasks to preserve category and page order
+        for fut in sorted(future_map.keys(), key=lambda f: (future_map[f][0], future_map[f][1])):
+            group_name, page_num = future_map[fut]
             try:
                 urls = fut.result()
+                count = 0
                 for u in urls:
                     if u not in seen_urls:
                         seen_urls.add(u)
                         discovered_movies.append((u, group_name))
+                        count += 1
+                print(f"[{group_name}] Page {page_num}: Found {count} items", flush=True)
             except Exception:
                 pass
 
-    print(f"⚡ Discovered {len(discovered_movies)} movie candidates. Resolving streams...", flush=True)
+    print(f"\n⚡ Total discovered items: {len(discovered_movies)}. Resolving stream URLs...", flush=True)
 
     # Phase 2: Process movies concurrently
     m3u_entries = []
@@ -169,7 +189,7 @@ def main():
                     entry, title = res
                     with lock:
                         m3u_entries.append(entry)
-                        print(f"   ⚡ Added: {title[:50]}...", flush=True)
+                        print(f"   ⚡ Added ({len(m3u_entries)}): {title[:55]}", flush=True)
             except Exception:
                 pass
 
