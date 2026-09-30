@@ -33,7 +33,7 @@ DOWNLOAD_PATTERN = re.compile(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+
 file_lock = asyncio.Lock()
 
 async def record_missing(tsv_writer, group, title, url, reason, extra_info=""):
-    """Appends an uncollected movie directly to the separate diagnostic file."""
+    """Appends an uncollected movie directly to the diagnostic file."""
     async with file_lock:
         tsv_writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -95,19 +95,9 @@ async def scan_category_page(session, sem, category_path, page_num, group_name, 
             continue
 
         seen.add(full_url)
-        title = title_tag.get_text(strip=True)
-        img_elem = article.select_one('.mpo-overlay-wrap img, .wp-post-image')
-        poster = ""
-        if img_elem:
-            poster = img_elem.get('src') or img_elem.get('data-src') or ""
-            if poster.startswith('//'):
-                poster = f"https:{poster}"
-
         page_movies.append({
             "url": full_url,
-            "group": group_name,
-            "title": title,
-            "poster": poster
+            "group": group_name
         })
 
     return page_movies
@@ -117,24 +107,29 @@ async def resolve_movie_stream(session, sem, movie, m3u_handle, tsv_writer, coun
         # Step 1: Open movie detail page
         page_html = await fetch_html(session, movie["url"])
         if not page_html:
-            await record_missing(tsv_writer, movie["group"], movie["title"], movie["url"], "Movie Detail Page Unreachable")
+            await record_missing(tsv_writer, movie["group"], "N/A", movie["url"], "Movie Detail Page Unreachable")
             return
 
         soup = BeautifulSoup(page_html, 'html.parser')
 
-        # Fallback Title & Poster
-        title_elem = soup.select_one('.mp-title, h1.entry-title, h1')
-        title = title_elem.get_text(strip=True) if title_elem else movie["title"]
-        title = re.sub(r'[\r\n\t]+', ' ', title).strip()
+        # Step 2: Strictly extract title from .mp-title
+        title_elem = soup.select_one('.mp-title')
+        if not title_elem:
+            await record_missing(tsv_writer, movie["group"], "N/A", movie["url"], "No .mp-title Found")
+            return
+        title = re.sub(r'[\r\n\t]+', ' ', title_elem.get_text(strip=True)).strip()
 
-        poster = movie.get("poster", "")
-        img_elem = soup.select_one('.mp-img-wrap img, .entry-content img')
-        if img_elem:
-            src = img_elem.get('src') or img_elem.get('data-src') or img_elem.get('data-lazy-src') or ""
-            if src:
-                poster = f"https:{src}" if src.startswith('//') else src
+        # Step 3: Strictly extract poster from .mp-img-wrap
+        poster = ""
+        img_wrap = soup.select_one('.mp-img-wrap')
+        if img_wrap:
+            img = img_wrap if img_wrap.name == 'img' else img_wrap.find('img')
+            if img:
+                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or ""
+                if src:
+                    poster = f"https:{src}" if src.startswith('//') else src
 
-        # Step 2: Extract multicloud link
+        # Step 4: Extract multicloud link
         multicloud_url = None
         cloud_match = CLOUD_PATTERN.search(page_html)
         if cloud_match:
@@ -147,22 +142,21 @@ async def resolve_movie_stream(session, sem, movie, m3u_handle, tsv_writer, coun
                     break
 
         if not multicloud_url:
-            # Capture what download/redirect links existed instead
             other_links = [
                 a.get('href') for a in soup.find_all('a', href=True)
                 if any(x in a.get('href', '').lower() for x in ['cloud', 'download', 'drive', 'hub', 'fast'])
             ]
-            first_alternative = other_links[0] if other_links else "No alternative link found"
-            await record_missing(tsv_writer, movie["group"], title, movie["url"], "No MultiCloud Link Found", first_alternative)
+            first_alt = other_links[0] if other_links else "No alternative link found"
+            await record_missing(tsv_writer, movie["group"], title, movie["url"], "No MultiCloud Link Found", first_alt)
             return
 
-        # Step 3: Open multicloud page
+        # Step 5: Open multicloud page
         cloud_html = await fetch_html(session, multicloud_url, referer=movie["url"])
         if not cloud_html:
             await record_missing(tsv_writer, movie["group"], title, movie["url"], "MultiCloud Page Unreachable", multicloud_url)
             return
 
-        # Step 4: Extract stream link
+        # Step 6: Extract stream link
         stream_link = None
         dl_match = DOWNLOAD_PATTERN.search(cloud_html)
         if dl_match:
@@ -183,7 +177,7 @@ async def resolve_movie_stream(session, sem, movie, m3u_handle, tsv_writer, coun
             await record_missing(tsv_writer, movie["group"], title, movie["url"], "No MultiDownload Link in MultiCloud Page", multicloud_url)
             return
 
-        # Step 5: Write valid M3U entry
+        # Step 7: Write verified M3U entry
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{movie["group"]}", {title}\n{stream_link}\n'
         async with file_lock:
             counter["count"] += 1
@@ -198,7 +192,6 @@ async def main():
     ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     now_str = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
-    # Open both output files
     with open(OUTPUT_M3U, "w", encoding="utf-8") as m3u_f, \
          open(MISSING_REPORT_FILE, "w", encoding="utf-8", newline="") as report_f:
 
