@@ -48,7 +48,7 @@ async def scan_category_page(session, sem, category_path, page_num, group_name):
         return []
 
     soup = BeautifulSoup(html, 'html.parser')
-    items = soup.select('.thumb-content, .item-list, article.post, .mp-post, .thumb, div[class*="movie-item"]')
+    items = soup.select('.article-content-col')
     
     page_movies = []
     seen = set()
@@ -94,7 +94,7 @@ async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
         if cloud_match:
             multicloud_url = cloud_match.group(0).rstrip('\\";),')
         else:
-            for tag in soup.find_all(['a', 'iframe'], href=True) + soup.find_all('iframe', src=True):
+            for tag in soup.find_all(['a', 'iframe'], src=True) + soup.find_all('a', href=True):
                 target = tag.get('href') or tag.get('src')
                 if target and 'multicloudlinks.' in target.lower():
                     multicloud_url = target.strip()
