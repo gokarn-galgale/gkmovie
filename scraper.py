@@ -48,20 +48,40 @@ async def scan_category_page(session, sem, category_path, page_num, group_name):
         return []
 
     soup = BeautifulSoup(html, 'html.parser')
-    items = soup.select('.article-content-col')
+    
+    # Target post articles rendered in the blog feed
+    articles = soup.select('.posts-wrapper article') or soup.select('article.post')
     
     page_movies = []
     seen = set()
 
-    for item in items:
-        a = item.find('a', href=True)
-        if not a:
+    for article in articles:
+        # Extract direct movie post title and link
+        title_tag = article.select_one('h2.entry-title a') or article.select_one('.blog-entry-title a')
+        if not title_tag or not title_tag.get('href'):
             continue
-        full_url = urljoin(BASE_URL, a['href'].strip())
+            
+        full_url = urljoin(BASE_URL, title_tag['href'].strip())
         if full_url in seen or re.search(r'/(category|tag|author|page)/', full_url, re.IGNORECASE):
             continue
+            
         seen.add(full_url)
-        page_movies.append({"url": full_url, "group": group_name})
+        
+        # Extract fallback title and poster thumbnail directly from article card
+        title = title_tag.get_text(strip=True)
+        img_elem = article.select_one('.mpo-overlay-wrap img, .wp-post-image')
+        poster = ""
+        if img_elem:
+            poster = img_elem.get('src') or img_elem.get('data-src') or ""
+            if poster.startswith('//'):
+                poster = f"https:{poster}"
+
+        page_movies.append({
+            "url": full_url, 
+            "group": group_name,
+            "title": title,
+            "poster": poster
+        })
 
     return page_movies
 
@@ -74,19 +94,19 @@ async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
 
         soup = BeautifulSoup(page_html, 'html.parser')
 
-        # Step 2: Extract .mp-title and .mp-img-wrap
-        title_elem = soup.select_one('.mp-title') or soup.find('h1')
-        title = title_elem.get_text(strip=True) if title_elem else "Unknown Movie"
+        # Step 2: Use title and poster from category scan as baseline fallback
+        title_elem = soup.select_one('.mp-title') or soup.find('h1') or soup.select_one('h1.entry-title')
+        title = title_elem.get_text(strip=True) if title_elem else movie.get("title", "Unknown Movie")
         title = re.sub(r'[\r\n\t]+', ' ', title).strip()
 
-        poster = ""
-        img_wrap = soup.select_one('.mp-img-wrap')
+        poster = movie.get("poster", "")
+        img_wrap = soup.select_one('.mp-img-wrap, .entry-content img')
         if img_wrap:
             img = img_wrap if img_wrap.name == 'img' else img_wrap.find('img')
             if img:
-                poster = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or ""
-                if poster.startswith('//'):
-                    poster = f"https:{poster}"
+                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or ""
+                if src:
+                    poster = f"https:{src}" if src.startswith('//') else src
 
         # Step 3: Fetch multicloudlinks.com URL
         multicloud_url = None
@@ -187,4 +207,7 @@ async def main():
     print(f"\n🎉 Done! Saved {counter['count']} items in {duration} minutes to {OUTPUT_FILE}", flush=True)
 
 if __name__ == "__main__":
+    import sys
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
