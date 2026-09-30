@@ -1,153 +1,172 @@
-from curl_cffi import requests
-from bs4 import BeautifulSoup
+import asyncio
+import aiohttp
+from datetime import datetime, timezone, timedelta
 import re
-from datetime import datetime
-import concurrent.futures
+from urllib.parse import unquote, urljoin
+from bs4 import BeautifulSoup
 
-BASE_URL = "http://new5.hdhub4u.cl"
-START_CATEGORY_URL = f"{BASE_URL}/category/south-hindi-movies/page/"
-PLAYLIST_FILE = "hdhub_playlist.m3u"
+# --- Configuration ---
+BASE_URL = "https://go4.india4movies.net"
+OUTPUT_FILE = "all_movies.m3u"
+PAGES_PER_CATEGORY = 15
+MAX_CONCURRENT_REQUESTS = 40
 
-def unpack(p, a, c, k):
-    def baseN(num, b):
-        chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        if num == 0: return "0"
-        res = ""
-        while num > 0:
-            res = chars[num % b] + res
-            num //= b
-        return res
+CATEGORIES = [
+    {"group_name": "Hollywood Hindi Movies", "category_path": "/category/hollywood-hindi-movies/"},
+    {"group_name": "Marathi Movies", "category_path": "/category/marathi-movies/"},
+    {"group_name": "Bollywood Movies", "category_path": "/category/bollywood-movies-download/"},
+    {"group_name": "South Dubbed Movies", "category_path": "/category/south-indian-hindi-dubbed-movies/"}
+]
 
-    for i in range(c - 1, -1, -1):
-        if k[i]:
-            word = baseN(i, a)
-            p = re.sub(r'\b' + word + r'\b', k[i], p)
-    return p
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
-def process_movie(movie_data):
-    title, url, poster = movie_data
+CLOUD_PATTERN = re.compile(r'https?://[^\s"\'<>`]*multicloudlinks\.[^\s"\'<>`]+', re.IGNORECASE)
+DOWNLOAD_PATTERN = re.compile(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', re.IGNORECASE)
+
+async def fetch_text(session, url, referer=None, timeout=6):
+    req_headers = HEADERS.copy()
+    if referer:
+        req_headers["Referer"] = referer
     try:
-        # curl_cffi দিয়ে রিয়েল ক্রোমের ভান করে ঢোকা
-        session = requests.Session(impersonate="chrome110", timeout=15)
-        res = session.get(url)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        content = soup.find('div', class_='entry-content') or soup
-        links = content.find_all('a', href=True)
-        
-        watch_link = None
-        for a in links:
-            href = a['href']
-            text = a.get_text(strip=True).lower()
-            if re.search(r'(watch|play|stream|online|player)', text) or re.search(r'(watch|play|stream|online|player)', href):
-                if href != "#":
-                    watch_link = href
-                    break
-        
-        if not watch_link:
-            return None
-            
-        watch_res = session.get(watch_link)
-        html = watch_res.text
-        
-        match = re.search(r"return p}\('(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)", html, re.DOTALL)
-        
-        if match:
-            p = match.group(1).replace("\\'", "'").replace("\\\\", "\\")
-            a = int(match.group(2))
-            c = int(match.group(3))
-            k = match.group(4).split('|')
-
-            unpacked = unpack(p, a, c, k)
-            
-            video_links = re.findall(r'https?://[^\s\'"<>\,\[\]\(\)]+?\.(?:m3u8|mp4)[^\s\'"<>\,\[\]\(\)]*', unpacked)
-            sub_links = re.findall(r'https?://[^\s\'"<>\,\[\]\(\)]+?\.(?:vtt|srt)[^\s\'"<>\,\[\]\(\)]*', unpacked)
-            
-            if video_links:
-                stream_url = video_links[0]
-                sub_url = sub_links[0] if sub_links else None
-                
-                m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="South Hindi Dubbed", {title}\n'
-                if sub_url:
-                    m3u_entry += f'#EXTVLCOPT:sub-file="{sub_url}"\n'
-                m3u_entry += f'{stream_url}\n'
-                
-                return m3u_entry
-        return None
-        
+        async with session.get(url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status == 200:
+                return await resp.text(errors='ignore')
     except Exception:
-        return None
+        pass
+    return None
 
-def main():
-    print("🚀 Starting Next-Gen M3U Scraper (Bypassing Cloudflare with curl_cffi)...")
+async def scan_category_page(session, sem, category_path, page_num, group_name):
+    url = urljoin(BASE_URL, category_path) if page_num == 1 else urljoin(BASE_URL, f"{category_path.rstrip('/')}/page/{page_num}/")
     
-    # Session তৈরি করা
-    session = requests.Session(impersonate="chrome110", timeout=15)
-    
-    all_movies = []
-    page = 1
-    
-    while True:
-        print(f"⏳ Scanning Page {page}...")
-        try:
-            res = session.get(f"{START_CATEGORY_URL}{page}/")
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
-            movies = soup.find_all('li', class_='thumb')
-            if not movies:
-                print(f"✅ Reached the end. Total pages scanned: {page - 1}")
-                break
-                
-            for movie in movies:
-                title = movie.find('p').text.strip() if movie.find('p') else "Unknown Title"
-                a_tag = movie.find('a')
-                img_tag = movie.find('img')
-                
-                if a_tag and img_tag:
-                    link = a_tag['href']
-                    if link.startswith('/'):
-                        link = f"{BASE_URL}{link}"
-                    poster = img_tag.get('src', '')
-                    all_movies.append((title, link, poster))
-            
-            # প্রথম ২ পেজ স্ক্যান করেই টেস্ট করুন (প্রয়োজনে এটি মুছে দেবেন সব পেজ স্ক্যান করতে)
-            if page >= 2: 
-                break
-                
-            page += 1
-        except Exception as e:
-            print(f"⚠️ Error scanning page {page}: {e}")
-            break
+    async with sem:
+        html = await fetch_text(session, url)
+        
+    if not html:
+        return []
 
-    print(f"\n🎬 Found {len(all_movies)} movies. Starting Vault Cracking with 30 THREADS...")
+    soup = BeautifulSoup(html, 'html.parser')
+    items = soup.select('.thumb-content, .item-list, article.post, .mp-post, .thumb, div[class*="movie-item"]')
     
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
-        future_to_movie = {executor.submit(process_movie, movie): movie for movie in all_movies}
-        
-        for future in concurrent.futures.as_completed(future_to_movie):
-            movie = future_to_movie[future]
-            try:
-                data = future.result()
-                if data:
-                    results.append(data)
-                    print(f"   ⚡ Success: {movie[0]}")
-                else:
-                    print(f"   ⚠️ Skipped: {movie[0]}")
-            except Exception:
-                pass
+    seen = set()
 
-    print("\n💾 Generating hdhub_playlist.m3u...")
-    with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+    for item in items:
+        a = item.find('a', href=True)
+        if not a:
+            continue
+        full_url = urljoin(BASE_URL, a['href'].strip())
+        if full_url in seen or re.search(r'/(category|tag|author|page)/', full_url, re.IGNORECASE):
+            continue
+        seen.add(full_url)
+
+        title_elem = item.select_one('.mp-title, h2, h3, .title') or a
+        title = title_elem.get_text(strip=True) if title_elem else "Unknown Movie"
+        title = re.sub(r'[\r\n\t]+', ' ', title).strip()
+
+        img = item.find('img')
+        poster = ""
+        if img:
+            poster = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or ""
+            if poster.startswith('//'):
+                poster = f"https:{poster}"
+
+        results.append({
+            "url": full_url,
+            "title": title,
+            "poster": poster,
+            "group": group_name
+        })
+
+    return results
+
+async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
+    async with sem:
+        page_html = await fetch_text(session, movie["url"])
+        if not page_html:
+            return
+
+        if movie["title"] == "Unknown Movie" or len(movie["title"]) < 2:
+            soup = BeautifulSoup(page_html, 'html.parser')
+            t = soup.select_one('.mp-title') or soup.find('h1')
+            if t:
+                movie["title"] = re.sub(r'[\r\n\t]+', ' ', t.get_text(strip=True)).strip()
+
+        cloud_match = CLOUD_PATTERN.search(page_html)
+        if not cloud_match:
+            return
+        cloud_url = cloud_match.group(0).rstrip('\\";),')
+
+        cloud_html = await fetch_text(session, cloud_url, referer=movie["url"])
+        if not cloud_html:
+            return
+
+        dl_match = DOWNLOAD_PATTERN.search(cloud_html)
+        if not dl_match:
+            return
+
+        stream_link = dl_match.group(0).rstrip('\\";),')
+        if 'url=' in stream_link:
+            param = re.search(r'url=([^&]+)', stream_link)
+            if param:
+                stream_link = unquote(param.group(1))
+
+        entry = f'#EXTINF:-1 tvg-logo="{movie["poster"]}" group-title="{movie["group"]}", {movie["title"]}\n{stream_link}\n'
+        
+        async with lock:
+            counter["count"] += 1
+            file_handle.write(entry)
+            file_handle.flush()
+            print(f"⚡ [{counter['count']}] Added: {movie['title'][:55]}", flush=True)
+
+async def main():
+    start_time = datetime.now()
+    sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    lock = asyncio.Lock()
+    counter = {"count": 0}
+
+    ist_time = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    now_str = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
+
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write('#EXTM3U x-tvg-url=""\n')
-        f.write('# Playlist Generated Automatically by HDHub4u Scraper\n')
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f'# Last Updated: {now}\n\n')
-        
-        for entry in results:
-            f.write(entry)
+        f.write(f'# Playlist Generated via Automated Scraper\n')
+        f.write(f'# Last Updated: {now_str}\n\n')
+        f.flush()
 
-    print("🎉 Done! Pure M3U Playlist generated successfully with Subtitles!")
+        connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            print(f"🚀 Scanning {len(CATEGORIES) * PAGES_PER_CATEGORY} category pages...", flush=True)
+
+            scan_tasks = [
+                scan_category_page(session, sem, cat["category_path"], p, cat["group_name"])
+                for cat in CATEGORIES
+                for p in range(1, PAGES_PER_CATEGORY + 1)
+            ]
+            
+            page_results = await asyncio.gather(*scan_tasks)
+            
+            candidates = []
+            seen_urls = set()
+            for page in page_results:
+                for item in page:
+                    if item["url"] not in seen_urls:
+                        seen_urls.add(item["url"])
+                        candidates.append(item)
+
+            print(f"⚡ Discovered {len(candidates)} candidates. Resolving streams...", flush=True)
+
+            resolve_tasks = [
+                resolve_movie_stream(session, sem, movie, f, lock, counter)
+                for movie in candidates
+            ]
+            
+            await asyncio.gather(*resolve_tasks)
+
+    duration = (datetime.now() - start_time).total_seconds()
+    print(f"\n🎉 Done! Saved {counter['count']} streams in {round(duration, 1)} seconds to {OUTPUT_FILE}", flush=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
