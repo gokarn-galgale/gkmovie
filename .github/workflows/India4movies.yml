@@ -31,14 +31,36 @@ jobs:
       - name: Run Scraper Script
         run: python scraper.py
 
-      - name: Commit and Push Playlist
+      - name: Preview Missing Items Summary
+        if: always()
+        run: |
+          if [ -f missing_movies_report.tsv ]; then
+            echo "=== TOP MISSING REASONS ==="
+            tail -n +2 missing_movies_report.tsv | cut -f5 | sort | uniq -c | sort -nr
+            echo "=== SAMPLE OF REPORT (FIRST 10 ITEMS) ==="
+            head -n 11 missing_movies_report.tsv
+          else
+            echo "No missing_movies_report.tsv found."
+          fi
+
+      - name: Commit and Push Playlist and Missing Report
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add all_movies.m3u
+          git add all_movies.m3u missing_movies_report.tsv
           if git diff --staged --quiet; then
-            echo "No changes found in playlist."
+            echo "No changes found in playlist or missing report."
           else
-            git commit -m "Auto-update all_movies.m3u [skip ci]"
+            git commit -m "Auto-update playlist & missing report [skip ci]"
             git push
           fi
+
+      - name: Upload Missing Report & Debug Log Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-diagnostic-reports
+          path: |
+            missing_movies_report.tsv
+            scraper_debug.log
+          if-no-files-found: ignore
