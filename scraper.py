@@ -4,12 +4,15 @@ from datetime import datetime, timezone, timedelta
 import re
 from urllib.parse import unquote, urljoin
 from bs4 import BeautifulSoup
+import sys
 
 # --- Configuration ---
 BASE_URL = "https://go4.india4movies.net"
 OUTPUT_FILE = "all_movies.m3u"
 PAGES_PER_CATEGORY = 15
-MAX_CONCURRENT_REQUESTS = 35
+
+# Lower concurrency slightly to prevent silent HTTP 429 / 503 / Cloudflare drops
+MAX_CONCURRENT_REQUESTS = 12
 
 CATEGORIES = [
     {"group_name": "Hollywood Hindi Movies", "category_path": "/category/hollywood-hindi-movies/"},
@@ -21,43 +24,53 @@ CATEGORIES = [
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 CLOUD_PATTERN = re.compile(r'https?://[^\s"\'<>`]*multicloudlinks\.[^\s"\'<>`]+', re.IGNORECASE)
 DOWNLOAD_PATTERN = re.compile(r'https?://[^\s"\'<>`]+multidownload\.[^\s"\'<>`]+', re.IGNORECASE)
 
-async def fetch_html(session, url, referer=None, timeout=8):
+async def fetch_html(session, url, referer=None, timeout=15, retries=3):
+    """Fetch HTML with exponential backoff on dropouts or rate-limiting."""
     req_headers = HEADERS.copy()
     if referer:
         req_headers["Referer"] = referer
-    try:
-        async with session.get(url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            if resp.status == 200:
-                return await resp.text(errors='ignore')
-    except Exception:
-        pass
+
+    for attempt in range(1, retries + 1):
+        try:
+            async with session.get(url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                if resp.status == 200:
+                    return await resp.text(errors='ignore')
+                elif resp.status in (429, 503, 502):
+                    await asyncio.sleep(2 * attempt)
+                else:
+                    return None
+        except Exception:
+            if attempt < retries:
+                await asyncio.sleep(1.5 * attempt)
     return None
 
 async def scan_category_page(session, sem, category_path, page_num, group_name):
-    url = urljoin(BASE_URL, category_path) if page_num == 1 else urljoin(BASE_URL, f"{category_path.rstrip('/')}/page/{page_num}/")
+    clean_cat = category_path.strip('/')
+    url = f"{BASE_URL}/{clean_cat}/" if page_num == 1 else f"{BASE_URL}/{clean_cat}/page/{page_num}/"
     
     async with sem:
         html = await fetch_html(session, url)
+        # Gentle pacing between category page fetches
+        await asyncio.sleep(0.15)
         
     if not html:
+        print(f"⚠️ [Failed Page] Could not load: {url}", flush=True)
         return []
 
     soup = BeautifulSoup(html, 'html.parser')
-    
-    # Target post articles rendered in the blog feed
-    articles = soup.select('.posts-wrapper article') or soup.select('article.post')
+    articles = soup.select('article[id^="post-"]') or soup.select('article.post')
     
     page_movies = []
     seen = set()
 
     for article in articles:
-        # Extract direct movie post title and link
-        title_tag = article.select_one('h2.entry-title a') or article.select_one('.blog-entry-title a')
+        title_tag = article.select_one('h2.entry-title a, h2.blog-entry-title a')
         if not title_tag or not title_tag.get('href'):
             continue
             
@@ -67,7 +80,7 @@ async def scan_category_page(session, sem, category_path, page_num, group_name):
             
         seen.add(full_url)
         
-        # Extract fallback title and poster thumbnail directly from article card
+        # Read poster & title directly from listing card
         title = title_tag.get_text(strip=True)
         img_elem = article.select_one('.mpo-overlay-wrap img, .wp-post-image')
         poster = ""
@@ -87,28 +100,26 @@ async def scan_category_page(session, sem, category_path, page_num, group_name):
 
 async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
     async with sem:
-        # Step 1: Open movie page
+        # Step 1: Open movie detail page
         page_html = await fetch_html(session, movie["url"])
         if not page_html:
             return
 
         soup = BeautifulSoup(page_html, 'html.parser')
 
-        # Step 2: Use title and poster from category scan as baseline fallback
-        title_elem = soup.select_one('.mp-title') or soup.find('h1') or soup.select_one('h1.entry-title')
+        # Fallback Title & Poster
+        title_elem = soup.select_one('.mp-title, h1.entry-title, h1')
         title = title_elem.get_text(strip=True) if title_elem else movie.get("title", "Unknown Movie")
         title = re.sub(r'[\r\n\t]+', ' ', title).strip()
 
         poster = movie.get("poster", "")
-        img_wrap = soup.select_one('.mp-img-wrap, .entry-content img')
-        if img_wrap:
-            img = img_wrap if img_wrap.name == 'img' else img_wrap.find('img')
-            if img:
-                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src') or ""
-                if src:
-                    poster = f"https:{src}" if src.startswith('//') else src
+        img_elem = soup.select_one('.mp-img-wrap img, .entry-content img')
+        if img_elem:
+            src = img_elem.get('src') or img_elem.get('data-src') or ""
+            if src:
+                poster = f"https:{src}" if src.startswith('//') else src
 
-        # Step 3: Fetch multicloudlinks.com URL
+        # Step 2: Extract multicloudlinks.com URL
         multicloud_url = None
         cloud_match = CLOUD_PATTERN.search(page_html)
         if cloud_match:
@@ -123,7 +134,7 @@ async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
         if not multicloud_url:
             return
 
-        # Step 4: Fetch multidownload link from multicloudlinks page
+        # Step 3: Open multicloudlinks page to grab multidownload URL
         cloud_html = await fetch_html(session, multicloud_url, referer=movie["url"])
         if not cloud_html:
             return
@@ -147,14 +158,14 @@ async def resolve_movie_stream(session, sem, movie, file_handle, lock, counter):
         if not stream_link:
             return
 
-        # Step 5: Export entry immediately to M3U
+        # Step 4: Write immediately
         m3u_entry = f'#EXTINF:-1 tvg-logo="{poster}" group-title="{movie["group"]}", {title}\n{stream_link}\n'
         
         async with lock:
             counter["count"] += 1
             file_handle.write(m3u_entry)
             file_handle.flush()
-            print(f"⚡ [{counter['count']}] Added: {title[:55]}", flush=True)
+            print(f"⚡ [{counter['count']}] Added: {title[:50]}", flush=True)
 
 async def main():
     start_time = datetime.now()
@@ -166,7 +177,6 @@ async def main():
     now_str = ist_time.strftime("%Y-%m-%d %I:%M:%S %p (IST)")
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        # Write M3U Header
         f.write('#EXTM3U x-tvg-url=""\n')
         f.write(f'# Playlist Generated Automatically\n')
         f.write(f'# Last Updated: {now_str}\n\n')
@@ -176,7 +186,6 @@ async def main():
         async with aiohttp.ClientSession(connector=connector) as session:
             print(f"🚀 Scanning {len(CATEGORIES) * PAGES_PER_CATEGORY} category pages...", flush=True)
 
-            # Stage 1: Collect 15 pages per category
             scan_tasks = [
                 scan_category_page(session, sem, cat["category_path"], p, cat["group_name"])
                 for cat in CATEGORIES
@@ -193,9 +202,8 @@ async def main():
                         seen_urls.add(item["url"])
                         all_movies.append(item)
 
-            print(f"⚡ Discovered {len(all_movies)} unique movies. Resolving streams...", flush=True)
+            print(f"⚡ Discovered {len(all_movies)} unique movies. Resolving stream links...", flush=True)
 
-            # Stage 2: Concurrent resolution & incremental append
             resolve_tasks = [
                 resolve_movie_stream(session, sem, movie, f, lock, counter)
                 for movie in all_movies
@@ -207,7 +215,6 @@ async def main():
     print(f"\n🎉 Done! Saved {counter['count']} items in {duration} minutes to {OUTPUT_FILE}", flush=True)
 
 if __name__ == "__main__":
-    import sys
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
