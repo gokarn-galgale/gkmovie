@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 import cloudscraper
 
 # --- Configuration ---
-BASE_URL = "https://go4.india4movies.net"
+BASE_URL = "https://go5.india4movies.net"
 OUTPUT_FILE = "all_movies.m3u"
 PAGES_PER_CATEGORY = 15
 MAX_WORKERS = 16  # Scaled for fast throughput within CI limits
