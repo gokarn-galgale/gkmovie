@@ -8,7 +8,7 @@ import sys
 import csv
 
 # --- Configuration ---
-BASE_URL = "https://go4.india4movies.net"
+BASE_URL = "https://go5.india4movies.net"
 OUTPUT_M3U = "all_movies.m3u"
 MISSING_REPORT_FILE = "missing_movies_report.tsv"
 PAGES_PER_CATEGORY = 15
