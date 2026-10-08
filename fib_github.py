@@ -26,9 +26,22 @@ thread_local = threading.local()
 
 def get_scraper():
     if not hasattr(thread_local, "scraper"):
-        thread_local.scraper = cloudscraper.create_scraper(
-            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+        # Mobile Chrome configuration
+        scraper = cloudscraper.create_scraper(
+            browser={
+                'browser': 'chrome',
+                'platform': 'android',
+                'mobile': True
+            }
         )
+        # Explicit Mobile Chrome User-Agent
+        scraper.headers.update({
+            'User-Agent': (
+                'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
+            )
+        })
+        thread_local.scraper = scraper
     return thread_local.scraper
 
 def get_resolution(text):
@@ -220,4 +233,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
