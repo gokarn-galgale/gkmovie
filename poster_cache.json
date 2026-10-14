@@ -12714,5 +12714,13 @@
   "movie:reporting live:2026:Hindi": {
     "poster": "",
     "backdrop": ""
+  },
+  "movie:matchbox the movie:2026:English": {
+    "poster": "",
+    "backdrop": ""
+  },
+  "movie:the pout pout fish:2026:English": {
+    "poster": "",
+    "backdrop": ""
   }
 }
