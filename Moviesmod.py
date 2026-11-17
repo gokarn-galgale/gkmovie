@@ -162,7 +162,7 @@ def format_chole_card(opt):
         yr = f".{opt['year']}" if opt.get("year") else ""
         se = f".S{int(opt['season']):02d}E{int(opt['episode']):02d}" if opt.get("season") and opt.get("episode") else ""
         
-        # FIX: Replaced f-strings containing regex backslashes with standard string concatenation
+        # Python 3.11 compatible format
         r = "." + re.sub(r'\s+', '.', res) if res else ""
         s = f".{source}" if source else ""
         c = f".{'.'.join(codecs)}" if codecs else ""
@@ -426,4 +426,36 @@ def resume_bot(url):
         return None
 
 if __name__ == "__main__":
-    print("Scraper successfully loaded and ready for workflow execution.")
+    print("Starting scraper and generating M3U playlist...")
+    
+    # 1. Fetch details for a movie (Example: The Matrix - TMDB ID 603)
+    meta = fetch_tmdb_details("603", "movie")
+    
+    m3u_content = "#EXTM3U\n"
+    
+    if meta:
+        # 2. Create the stream configuration
+        stream_data = {
+            "title": meta["title"],
+            "year": meta["year"],
+            "quality": "1080p",
+            "server": "MoviesMod",
+            "provider": "AutoScraper",
+            "defaultLang": "🇮🇳 Hindi"
+        }
+        
+        # 3. Format it using your custom Chole Card function
+        card = format_chole_card(stream_data)
+        
+        # 4. Add it to the M3U text
+        # (You will replace fake_stream_url with the output of your actual scraper loop later)
+        fake_stream_url = "https://example.com/stream/matrix.mp4"
+        
+        m3u_content += f'#EXTINF:-1 group-title="Movies",{card["name"]}\n'
+        m3u_content += f'{fake_stream_url}\n'
+
+    # 5. Save the file so GitHub Actions can commit it
+    with open("playlist.m3u", "w", encoding="utf-8") as f:
+        f.write(m3u_content)
+        
+    print("playlist.m3u has been generated successfully!")
