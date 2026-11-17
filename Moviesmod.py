@@ -161,11 +161,14 @@ def format_chole_card(opt):
         base_title = re.sub(r'[^a-zA-Z0-9]+', '.', opt.get("title", "Video"))
         yr = f".{opt['year']}" if opt.get("year") else ""
         se = f".S{int(opt['season']):02d}E{int(opt['episode']):02d}" if opt.get("season") and opt.get("episode") else ""
-        r = f".{re.sub(r'ws+', '.', res)}" if res else ""
+        
+        # FIX: Replaced f-strings containing regex backslashes with standard string concatenation
+        r = "." + re.sub(r'\s+', '.', res) if res else ""
         s = f".{source}" if source else ""
         c = f".{'.'.join(codecs)}" if codecs else ""
-        a = f".{re.sub(r'[^a-zA-Z0-9]+', '.', audio[0])}" if audio else ""
-        g = f"-{re.sub(r'[\\sw_]+', '', server)}" if server else f"-{opt.get('provider', 'Release')}"
+        a = "." + re.sub(r'[^a-zA-Z0-9]+', '.', audio[0]) if audio else ""
+        g = "-" + re.sub(r'[\s\-_]+', '', server) if server else f"-{opt.get('provider', 'Release')}"
+        
         filename = f"{base_title}{yr}{se}{r}{s}{c}{a}{g}.mkv"
 
     spec_tags = [t for t in [res, source] + codecs if t]
@@ -424,4 +427,3 @@ def resume_bot(url):
 
 if __name__ == "__main__":
     print("Scraper successfully loaded and ready for workflow execution.")
-    # Place your execution logic/workflow loops here.
