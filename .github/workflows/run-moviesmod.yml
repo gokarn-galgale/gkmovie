@@ -2,13 +2,17 @@ name: Run MoviesMod Scraper
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Runs every 6 hours automatically
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+    - cron: '0 */6 * * *' 
+  workflow_dispatch: 
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
     
+    # THIS IS REQUIRED TO ALLOW GITHUB TO SAVE THE FILE
+    permissions:
+      contents: write
+      
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -26,10 +30,9 @@ jobs:
       - name: Execute Scraper
         run: python Moviesmod.py
 
-      # Optional: Use this block if your script generates a file (like an M3U or JSON) that needs saving
-      #- name: Commit and Push Results
-      #  run: |
-      #    git config --local user.name "github-actions[bot]"
-      #    git config --local user.email "github-actions[bot]@users.noreply.github.com"
-      #    git add .
-      #    git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update scraper data" && git push)
+      - name: Commit and Push Results
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update playlist" && git push)
