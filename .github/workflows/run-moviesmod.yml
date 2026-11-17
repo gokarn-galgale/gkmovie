@@ -24,7 +24,7 @@ jobs:
           pip install requests beautifulsoup4
 
       - name: Execute Scraper
-        run: python moviesmod.py
+        run: python Moviesmod.py
 
       # Optional: Use this block if your script generates a file (like an M3U or JSON) that needs saving
       #- name: Commit and Push Results
